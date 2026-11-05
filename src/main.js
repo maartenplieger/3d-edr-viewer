@@ -12,6 +12,24 @@ const DEFAULT_URL =
 const WMS_URL = 'https://geoservices.knmi.nl/wms?DATASET=baselayers&';
 const BORDERS_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-10m.json';
 const PRESSURE_PARAM = 'air_pressure_ml';
+
+// One-click views. bbox: 'full' = model domain extent, or [W, S, E, N]; levels: 'all' or [from, to];
+// stride: horizontal step ('auto' or 1–4);
+// threshold sets the first isosurface value (also the volume's fill threshold).
+const PRESETS = [
+  {
+    name: 'Jet stream – full domain',
+    description: 'Wind speed, all levels, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
+    bbox: 'full',
+    stride: '4', // horizontal step: 'auto' or 1–4
+    parameter: 'wind_speed_ml',
+    levels: 'all',
+    renderMode: 'volume',
+    volStyle: '0', // 0 = fill above, 1 = fill below, 2 = band
+    threshold: 50,
+    vscale: 10,
+  },
+];
 const KM_SCALE = 5; // world units per km of altitude in pressure-altitude mode
 const MAX_ISO_LINES = 4;
 
@@ -75,15 +93,19 @@ const sliceUniforms = {
 };
 
 const sliceMaterial = new THREE.ShaderMaterial({
-  uniforms: sliceUniforms,
+  uniforms: { ...sliceUniforms, ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog) },
+  fog: true,
   side: THREE.DoubleSide,
   transparent: true,
   vertexShader: /* glsl */ `
     attribute float value;
     varying float vValue;
+    #include <fog_pars_vertex>
     void main() {
       vValue = value;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * mvPosition;
+      #include <fog_vertex>
     }`,
   fragmentShader: /* glsl */ `
     uniform sampler2D cmap;
@@ -91,6 +113,7 @@ const sliceMaterial = new THREE.ShaderMaterial({
     uniform float isoValues[${MAX_ISO_LINES}];
     uniform vec3 isoColors[${MAX_ISO_LINES}];
     varying float vValue;
+    #include <fog_pars_fragment>
     void main() {
       if (vValue < -1e29) discard;
       float t = clamp((vValue - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0);
@@ -107,6 +130,10 @@ const sliceMaterial = new THREE.ShaderMaterial({
         c = mix(c, vec3(0.0), 1.0 - smoothstep(1.5, 2.5, d));
         c = mix(c, isoColors[n], 1.0 - smoothstep(0.5, 1.5, d));
       }
+      #ifdef USE_FOG
+        // Output is not colour-managed here, so fade towards the sRGB haze colour.
+        c = mix(c, pow(fogColor, vec3(1.0 / 2.2)), smoothstep(fogNear, fogFar, vFogDepth));
+      #endif
       gl_FragColor = vec4(c, opacity);
     }`,
 });
@@ -119,6 +146,7 @@ const volumeMaterial = createVolumeMaterial({
   isoColors: sliceUniforms.isoColors,
 });
 const volumeUniforms = volumeMaterial.uniforms;
+const isoDepthMaterial = new THREE.MeshBasicMaterial({ colorWrite: false, side: THREE.DoubleSide });
 
 new ResizeObserver(() => {
   const { clientWidth: w, clientHeight: h } = $('view');
@@ -129,8 +157,29 @@ new ResizeObserver(() => {
 
 let pickPending = false;
 const pointer = new THREE.Vector2();
+// Depth haze: linear fog fitted to the scene every frame, so it starts at the front of the data
+// and reaches the chosen strength (roughly) at the back, whatever the zoom level.
+const haze = new THREE.Fog(0x4a5a6a, 1, 2);
+const tmpBox = new THREE.Box3();
+const tmpSphere = new THREE.Sphere();
+
+function updateHaze() {
+  scene.fog = $('hazeOn').checked && state.geo ? haze : null;
+  if (!scene.fog) return;
+  const { px, py, zmin, zmax } = state.geo;
+  const s = vscale();
+  tmpBox.min.set(px[0], py[0], zmin * s);
+  tmpBox.max.set(px.at(-1), py.at(-1), zmax * s);
+  tmpBox.getBoundingSphere(tmpSphere);
+  const d = camera.position.distanceTo(tmpSphere.center);
+  const strength = Number($('hazeAmount').value);
+  haze.near = Math.max(0, d - tmpSphere.radius);
+  haze.far = haze.near + (2 * tmpSphere.radius) / Math.max(strength, 0.01);
+}
+
 renderer.setAnimationLoop(() => {
   controls.update();
+  updateHaze();
   if (state.volume && volumeGroup.visible) updateVolumeCamera(state.volume.mesh, camera);
   if (pickPending) {
     pickPending = false;
@@ -274,6 +323,7 @@ async function loadData() {
       bbox: readBBox(),
       levelFrom, levelTo, params,
       levelsPerRequest: Number($('levelsPerRequest').value) || 5,
+      stride: $('stride').value === 'auto' ? 'auto' : Number($('stride').value),
       fixScale: $('fixScale').value,
       concurrency: Number($('concurrency').value) || 6,
     };
@@ -300,7 +350,8 @@ async function loadData() {
     rebuildAll();
     fitCamera();
     const s = ((performance.now() - t0) / 1000).toFixed(1);
-    setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points with ${grid.requests} request${grid.requests > 1 ? 's' : ''} in ${s} s` +
+    const step = grid.stride > 1 ? ` (${grid.sourceSize.join('×')} averaged ${grid.stride}×${grid.stride})` : '';
+    setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${step} with ${grid.requests} request${grid.requests > 1 ? 's' : ''} in ${s} s` +
       (grid.scaleFixed ? ` (×10 server fix applied to ${grid.scaleFixed} response${grid.scaleFixed > 1 ? 's' : ''})` : ''));
   } catch (e) {
     if (e.name === 'AbortError') setStatus('Cancelled');
@@ -406,7 +457,8 @@ function computeGeo() {
       for (let n = k * layer; n < (k + 1) * layer; n++) if (pz[n] !== pz[n]) pz[n] = cnt ? sum / cnt : 0;
     }
   } else {
-    levelSpacing = (0.6 * ext) / Math.max(nz - 1, 1);
+    // Box height ~0.6× the width for small areas, capped so large domains stay flat.
+    levelSpacing = (0.6 * Math.min(ext, 500)) / Math.max(nz - 1, 1);
     for (let k = 0; k < nz; k++) pz.fill((nz - 1 - k) * levelSpacing, k * nx * ny, (k + 1) * nx * ny);
   }
   let zmin = Infinity, zmax = -Infinity;
@@ -794,14 +846,21 @@ function buildIso(iso) {
   geom.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
   geom.setAttribute('ijk', new THREE.BufferAttribute(r.ijk, 3));
   geom.setIndex(new THREE.BufferAttribute(r.indices, 1));
-  geom.computeVertexNormals();
+  geom.setAttribute('normal', new THREE.BufferAttribute(r.normals, 3));
   const opacity = Number($('isoOpacity').value);
   const mat = new THREE.MeshStandardMaterial({
     color: iso.color, roughness: 0.55, metalness: 0.05, side: THREE.DoubleSide,
-    transparent: opacity < 1, opacity, depthWrite: opacity >= 0.99,
+    transparent: opacity < 1, opacity,
   });
   iso.mesh = new THREE.Mesh(geom, mat);
   iso.mesh.userData.iso = iso;
+  // Depth pre-pass: when semi-transparent, only the front-most layer of the surface is blended,
+  // instead of all layers in arbitrary triangle order (which shows up as streaks).
+  const prepass = new THREE.Mesh(geom, isoDepthMaterial);
+  prepass.renderOrder = 1; // after the opaque ground/borders, before transparent objects
+  prepass.visible = opacity < 1;
+  iso.mesh.add(prepass);
+  iso.prepass = prepass;
   isoGroup.add(iso.mesh);
 }
 
@@ -856,7 +915,7 @@ function makeLabel(text, height) {
   ctx.fillText(text, 6, c.height / 2);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, fog: false }));
   sprite.scale.set((height * c.width) / c.height, height, 1);
   return sprite;
 }
@@ -885,12 +944,15 @@ function buildLabels() {
 
   const x = px[0] - pad, y = py.at(-1) + pad; // vertical axis on the north-west corner
   if (vmode === 'pressure') {
-    const kmMax = zmax / KM_SCALE, step = niceStep(kmMax, 8);
+    const kmMax = zmax / KM_SCALE, step = niceStep(kmMax, Math.max(1, Math.min(8, Math.floor((zmax * s) / (1.4 * h)))));
     for (let km = 0; km <= kmMax; km += step) add(`${km} km`, x, y, km * KM_SCALE * s);
   } else {
-    const nz = levels.length, step = nz > 40 ? 10 : nz > 15 ? 5 : 1;
+    // Pick a level step that leaves at least ~1.4 label heights between labels.
+    const nz = levels.length, room = (nz - 1) * levelSpacing * s;
+    const step = [1, 2, 5, 10, 20, 40, 80].find((st) => room / Math.max(1, (nz - 1) / st) >= 1.4 * h) ?? 100;
     for (let k = 0; k < nz; k++) {
-      if (levels[k] % step === 0 || k === 0 || k === nz - 1) add(`L${levels[k]}`, x, y, (nz - 1 - k) * levelSpacing * s);
+      const end = k === 0 || k === nz - 1, nearEnd = Math.min(k, nz - 1 - k) < step / 2;
+      if (end || (levels[k] % step === 0 && !nearEnd)) add(`L${levels[k]}`, x, y, (nz - 1 - k) * levelSpacing * s);
     }
   }
 }
@@ -974,7 +1036,7 @@ canvas.addEventListener('pointerleave', () => ($('tooltip').hidden = true));
 
 for (const name of COLORMAP_NAMES) $('colormap').append(option(name, name));
 
-for (const id of ['isoOpacity', 'sliceOpacity', 'volWidth', 'volSteps', 'mapBrightness']) {
+for (const id of ['isoOpacity', 'sliceOpacity', 'volWidth', 'volSteps', 'mapBrightness', 'hazeAmount']) {
   const el = $(id), out = el.nextElementSibling;
   const show = () => (out.textContent = Number(el.step) >= 1 ? el.value : Number(el.value).toFixed(2));
   el.addEventListener('input', show);
@@ -982,6 +1044,76 @@ for (const id of ['isoOpacity', 'sliceOpacity', 'volWidth', 'volSteps', 'mapBrig
 }
 
 $('applyUrl').addEventListener('click', applyUrl);
+const setBBox = (b) => ['bboxW', 'bboxS', 'bboxE', 'bboxN'].forEach((id, n) => ($(id).value = b[n]));
+$('defaultDomain').addEventListener('click', () => {
+  setBBox(parseCubeUrl(DEFAULT_URL).bbox);
+  $('stride').value = 'auto'; // a preset may have left a coarse step that would ruin the small area
+  loadData();
+});
+// Model domain extent from the instance (or collection) metadata, rounded outwards.
+function fullDomainBBox() {
+  const inst = state.instances.find((i) => i.id === $('instance').value);
+  const bbox = (inst || state.collection)?.extent?.spatial?.bbox?.[0];
+  if (!bbox) return null;
+  const round = (v, up) => (up ? Math.ceil(v * 100) : Math.floor(v * 100)) / 100;
+  return bbox.map((v, n) => round(v, n >= 2));
+}
+
+$('fullDomain').addEventListener('click', () => {
+  const bbox = fullDomainBBox();
+  if (!bbox) {
+    setStatus('No spatial extent in the collection metadata', true);
+    return;
+  }
+  setBBox(bbox);
+  loadData();
+});
+
+function applyPreset(p) {
+  if (!state.collection) {
+    setStatus('Collection metadata not loaded yet', true);
+    return;
+  }
+  const bbox = p.bbox === 'full' ? fullDomainBBox() : p.bbox;
+  if (bbox) setBBox(bbox);
+  if (p.parameter) {
+    if (!state.collection.parameter_names?.[p.parameter]) {
+      setStatus(`Parameter ${p.parameter} not in this collection`, true);
+      return;
+    }
+    $('parameter').value = p.parameter;
+  }
+  if (p.stride != null) $('stride').value = String(p.stride);
+  if (p.levels === 'all') {
+    $('levelFrom').value = $('levelFrom').min || 1;
+    $('levelTo').value = $('levelTo').max || 90;
+  } else if (p.levels) {
+    [$('levelFrom').value, $('levelTo').value] = p.levels;
+  }
+  if (p.renderMode) {
+    $('renderMode').value = p.renderMode;
+    applyRenderMode();
+  }
+  if (p.volStyle != null) $('volStyle').value = p.volStyle;
+  if (p.threshold != null) {
+    const iso = state.isos[0] || addIso(p.threshold);
+    iso.value = p.threshold;
+    iso.el.range.value = iso.el.num.value = p.threshold;
+    if (!iso.visible) iso.el.row.querySelector('input[type=checkbox]').click();
+  }
+  if (p.vscale) $('vscale').value = Math.log10(p.vscale);
+  updateVolumeSettings();
+  updateIsoLines();
+  applyVScale();
+  loadData();
+}
+
+for (const p of PRESETS) {
+  const b = document.createElement('button');
+  b.innerHTML = `${p.name}<small>${p.description}</small>`;
+  b.addEventListener('click', () => applyPreset(p));
+  $('presetList').append(b);
+}
 $('load').addEventListener('click', loadData);
 $('cancel').addEventListener('click', () => state.abort?.abort());
 $('collectionUrl').addEventListener('change', () =>
@@ -1003,8 +1135,9 @@ $('isoOpacity').addEventListener('input', () => {
   const o = Number($('isoOpacity').value);
   for (const iso of state.isos) {
     if (!iso.mesh) continue;
-    Object.assign(iso.mesh.material, { opacity: o, transparent: o < 1, depthWrite: o >= 0.99 });
+    Object.assign(iso.mesh.material, { opacity: o, transparent: o < 1 });
     iso.mesh.material.needsUpdate = true;
+    iso.prepass.visible = o < 1;
   }
 });
 $('renderMode').addEventListener('change', applyRenderMode);

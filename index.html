@@ -23,6 +23,11 @@
     </header>
 
     <details open>
+      <summary>Presets</summary>
+      <div id="presetList" class="presets"></div>
+    </details>
+
+    <details open>
       <summary>Data</summary>
       <label class="stack">EDR cube URL
         <textarea id="url" rows="4" spellcheck="false"></textarea>
@@ -42,6 +47,21 @@
         <label class="stack">South <input id="bboxS" type="number" step="0.1"></label>
         <label class="stack">East <input id="bboxE" type="number" step="0.1"></label>
         <label class="stack">North <input id="bboxN" type="number" step="0.1"></label>
+      </div>
+      <div class="row">
+        <button id="defaultDomain" class="grow" title="Set the bbox back to the default Netherlands area and load it">Netherlands</button>
+        <button id="fullDomain" class="grow" title="Set the bbox to the model domain extent and load it">Full model domain</button>
+      </div>
+      <div class="row">
+        <label class="stack grow" title="Average n×n server grid points; auto keeps each level below ~100k points">Horizontal step
+          <select id="stride">
+            <option value="auto" selected>auto</option>
+            <option value="1">1 (full resolution)</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
+        </label>
       </div>
       <div class="row">
         <label class="stack grow">Level from <input id="levelFrom" type="number" min="1" value="10"></label>
@@ -160,6 +180,8 @@
         <label class="check"><input id="boxOn" type="checkbox" checked> Box</label>
         <label class="check"><input id="labelsOn" type="checkbox" checked> Labels</label>
       </div>
+      <label class="check"><input id="hazeOn" type="checkbox" checked> Depth haze (fade distant data)</label>
+      <label class="slider">Haze amount <input id="hazeAmount" type="range" min="0.05" max="1" step="0.05" value="0.4"><output></output></label>
       <button id="resetView">Reset view</button>
     </details>
   </aside>

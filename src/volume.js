@@ -1,27 +1,32 @@
 // Ray-marched volume rendering of a scalar field stored in a 3D texture.
 import * as THREE from 'three';
 
-const MISSING = -60000; // fits in a half float; anything below MISSING / 2 counts as no data
+const half = THREE.DataUtils.toHalfFloat;
+
+// Texel pair (value × mask, mask): linear filtering then averages only valid neighbours,
+// recovered in the shader as r / g.
+function put(out, i, v) {
+  const ok = v === v;
+  out[2 * i] = half(ok ? v : 0);
+  out[2 * i + 1] = half(ok ? 1 : 0);
+}
 
 /**
- * Resamples the field onto a grid that is regular in world z, bottom level first, as half floats.
- * pz holds the world height of every grid point (k = 0 is the top level).
+ * Resamples the field onto a grid that is regular in world z, bottom level first, as RG half
+ * floats (value, validity). pz holds the world height of every grid point (k = 0 is the top level).
  */
 export function resampleVolume(field, nx, ny, nz, pz, zmin, zmax, uniformLevels) {
   const layer = nx * ny;
   if (uniformLevels) {
-    const out = new Uint16Array(layer * nz);
+    const out = new Uint16Array(layer * nz * 2);
     for (let t = 0; t < nz; t++) {
       const src = (nz - 1 - t) * layer;
-      for (let n = 0; n < layer; n++) {
-        const v = field[src + n];
-        out[t * layer + n] = THREE.DataUtils.toHalfFloat(v === v ? v : MISSING);
-      }
+      for (let n = 0; n < layer; n++) put(out, t * layer + n, field[src + n]);
     }
     return { data: out, depth: nz };
   }
   const depth = Math.min(256, Math.max(96, nz * 2));
-  const out = new Uint16Array(layer * depth);
+  const out = new Uint16Array(layer * depth * 2);
   for (let n = 0; n < layer; n++) {
     const h = (k) => pz[k * layer + n];
     let k = nz - 1;
@@ -37,7 +42,7 @@ export function resampleVolume(field, nx, ny, nz, pz, zmin, zmax, uniformLevels)
           v = lo + (hi - lo) * f;
         }
       }
-      out[t * layer + n] = THREE.DataUtils.toHalfFloat(v === v ? v : MISSING);
+      put(out, t * layer + n, v);
     }
   }
   return { data: out, depth };
@@ -57,9 +62,12 @@ export function createVolumeMaterial(shared) {
     useCmap: { value: 0 },
     cmin: { value: 0 }, // colour-map range of the volume
     cmax: { value: 1 },
+    localToView: { value: new THREE.Matrix4() },
+    ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
   };
   return new THREE.ShaderMaterial({
     uniforms,
+    fog: true,
     transparent: true,
     depthWrite: false,
     side: THREE.FrontSide,
@@ -81,8 +89,13 @@ export function createVolumeMaterial(shared) {
       uniform int style;
       uniform float isoValues[4];
       uniform vec3 isoColors[4];
+      uniform mat4 localToView;
       varying vec3 vOrigin;
       varying vec3 vDirection;
+      #ifdef USE_FOG
+        uniform vec3 fogColor;
+        uniform float fogNear, fogFar;
+      #endif
 
       vec2 hitBox(vec3 o, vec3 d) {
         vec3 inv = 1.0 / d;
@@ -90,8 +103,15 @@ export function createVolumeMaterial(shared) {
         vec3 tmin = min(t0, t1), tmax = max(t0, t1);
         return vec2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
       }
+      // Value at p (averaged over valid neighbours only); valid receives the validity weight.
+      float sampleVol(vec3 p, out float valid) {
+        vec2 s = texture(vol, (p * (texSize - 1.0) + 0.5) / texSize).rg;
+        valid = s.g;
+        return s.r / max(s.g, 1e-4);
+      }
       float sampleVol(vec3 p) {
-        return texture(vol, (p * (texSize - 1.0) + 0.5) / texSize).r;
+        float valid;
+        return sampleVol(p, valid);
       }
       vec3 cmapColor(float v) {
         return texture(cmap, vec2(clamp((v - cmin) / max(cmax - cmin, 1e-6), 0.0, 1.0), 0.5)).rgb;
@@ -128,8 +148,9 @@ export function createVolumeMaterial(shared) {
         for (int n = 0; n < 2048; n++) {
           if (t > b.y) break;
           vec3 p = vOrigin + d * t + 0.5;
-          float v = sampleVol(p);
-          if (v > -30000.0) {
+          float valid;
+          float v = sampleVol(p, valid);
+          if (valid > 0.5) {
             vec3 col;
             float a = transfer(v, col);
             if (a > 0.004) {
@@ -139,7 +160,13 @@ export function createVolumeMaterial(shared) {
                 sampleVol(p + vec3(0, 0, g.z)) - sampleVol(p - vec3(0, 0, g.z)));
               float shade = length(grad) > 1e-4 ? 0.45 + 0.55 * abs(dot(normalize(grad), light)) : 0.8;
               float alpha = 1.0 - exp(-a * density * 12.0 * dt);
-              acc.rgb += (1.0 - acc.a) * alpha * col * shade;
+              col *= shade;
+              #ifdef USE_FOG
+                // Depth haze per sample, at that sample's own view depth.
+                float depth = -(localToView * vec4(p - 0.5, 1.0)).z;
+                col = mix(col, pow(fogColor, vec3(1.0 / 2.2)), smoothstep(fogNear, fogFar, depth));
+              #endif
+              acc.rgb += (1.0 - acc.a) * alpha * col;
               acc.a += (1.0 - acc.a) * alpha;
               if (acc.a > 0.97) break;
             }
@@ -154,7 +181,7 @@ export function createVolumeMaterial(shared) {
 
 export function createVolumeTexture({ data, depth }, nx, ny) {
   const tex = new THREE.Data3DTexture(data, nx, ny, depth);
-  tex.format = THREE.RedFormat;
+  tex.format = THREE.RGFormat;
   tex.type = THREE.HalfFloatType;
   tex.minFilter = tex.magFilter = THREE.LinearFilter;
   tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
@@ -169,6 +196,8 @@ const tmp = new THREE.Vector3();
 // front faces from outside the box, back faces from inside.
 export function updateVolumeCamera(mesh, camera) {
   mesh.updateWorldMatrix(true, false);
+  camera.updateMatrixWorld();
+  mesh.material.uniforms.localToView.value.multiplyMatrices(camera.matrixWorldInverse, mesh.matrixWorld);
   const c = mesh.worldToLocal(tmp.copy(camera.position));
   mesh.material.uniforms.cameraLocal.value.copy(c);
   const inside = Math.abs(c.x) < 0.5 && Math.abs(c.y) < 0.5 && Math.abs(c.z) < 0.5;

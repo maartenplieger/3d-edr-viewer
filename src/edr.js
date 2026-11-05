@@ -138,6 +138,8 @@ function forEachValue(range, fn) {
 
 const isFrac = (v) => Math.abs(v - Math.round(v)) > 1e-3;
 
+const FILL_VALUE = -9999; // returned outside the model domain
+
 // Undoes the KNMI ×10 bug in one response, in place: in multi-level responses every level after
 // the first comes back multiplied by 10 (whole numbers only). Returns true when values changed.
 function fixScaleBug(json, mode) {
@@ -150,13 +152,13 @@ function fixScaleBug(json, mode) {
       if (mode === 'auto') {
         let firstFrac = false, restFrac = false;
         forEachValue(range, (k, j, i, v) => {
-          if (isFrac(v)) k === 0 ? (firstFrac = true) : (restFrac = true);
+          if (v > FILL_VALUE && isFrac(v)) k === 0 ? (firstFrac = true) : (restFrac = true);
         });
         if (!firstFrac || restFrac) continue;
       }
       const v = range.values;
       forEachValue(range, (k, j, i, val, idx) => {
-        if (k > 0 && v[idx] != null) v[idx] /= 10;
+        if (k > 0 && v[idx] != null && v[idx] > FILL_VALUE) v[idx] /= 10; // fill values are not scaled
       });
       fixed = true;
     }
@@ -164,10 +166,14 @@ function fixScaleBug(json, mode) {
   return fixed;
 }
 
+const MAX_POINTS_PER_LEVEL = 100000; // 'auto' horizontal step keeps levels below this size
+
 /**
  * Loads a 3D cube into a regular grid with lon/lat ascending and levels ascending.
  * data[param][(k * ny + j) * nx + i]
  *
+ * `stride` ('auto' or n) averages n×n blocks of server grid points while ingesting, so large
+ * areas such as the full model domain stay manageable.
  * Levels are fetched in chunks of `levelsPerRequest` (z=a/b), `concurrency` requests at a time.
  * fixScale ('auto' | 'on' | 'off') controls the per-response ×10 correction, see fixScaleBug.
  */
@@ -178,19 +184,40 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
   const params = [...new Set(o.params)];
   let grid = null;
 
+  // Maps source indices (server order) to averaged, ascending block indices; -1 = dropped edge.
+  const blockAxis = (vals, stride) => {
+    const n = vals.length, rev = vals[0] > vals[n - 1];
+    const sorted = rev ? [...vals].reverse() : vals;
+    const nb = Math.max(1, Math.floor(n / stride));
+    const centers = Array.from({ length: nb }, (_, b) => {
+      let s = 0, c = 0;
+      for (let i = b * stride; i < Math.min(n, (b + 1) * stride); i++) { s += sorted[i]; c++; }
+      return s / c;
+    });
+    const map = Int32Array.from({ length: n }, (_, i) => {
+      const b = Math.floor((rev ? n - 1 - i : i) / stride);
+      return b < nb ? b : -1;
+    });
+    return { centers, map };
+  };
+
   const ensureGrid = (domain) => {
     if (grid) return;
     const xs = axisValues(domain.axes.x).map(Number);
     const ys = axisValues(domain.axes.y).map(Number);
-    const nx = xs.length, ny = ys.length, nz = levels.length;
-    const xRev = xs[0] > xs[nx - 1], yRev = ys[0] > ys[ny - 1];
+    const stride = o.stride && o.stride !== 'auto' ? Math.max(1, Math.round(o.stride))
+      : Math.max(1, Math.ceil(Math.sqrt((xs.length * ys.length) / MAX_POINTS_PER_LEVEL)));
+    const bx = blockAxis(xs, stride), by = blockAxis(ys, stride);
+    const nx = bx.centers.length, ny = by.centers.length, nz = levels.length;
     grid = {
-      nx, ny, nz, levels,
-      lons: xRev ? [...xs].reverse() : xs,
-      lats: yRev ? [...ys].reverse() : ys,
-      imap: Int32Array.from({ length: nx }, (_, i) => (xRev ? nx - 1 - i : i)),
-      jmap: Int32Array.from({ length: ny }, (_, j) => (yRev ? ny - 1 - j : j)),
-      data: Object.fromEntries(params.map((p) => [p, new Float32Array(nx * ny * nz).fill(NaN)])),
+      nx, ny, nz, levels, stride,
+      sourceSize: [xs.length, ys.length],
+      lons: bx.centers,
+      lats: by.centers,
+      imap: bx.map,
+      jmap: by.map,
+      sum: Object.fromEntries(params.map((p) => [p, new Float32Array(nx * ny * nz)])),
+      count: Object.fromEntries(params.map((p) => [p, new Uint8Array(nx * ny * nz)])),
     };
   };
 
@@ -200,12 +227,15 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
       const zv = axisValues(cov.domain.axes.z) ?? [fallbackLevel];
       const { nx, ny, imap, jmap } = grid;
       for (const [name, range] of Object.entries(cov.ranges)) {
-        const target = grid.data[name];
-        if (!target) continue;
+        const sum = grid.sum[name], count = grid.count[name];
+        if (!sum) continue;
         forEachValue(range, (kc, j, i, val) => {
           const k = levelIndex.get(Number(zv[kc]));
-          if (k === undefined) return;
-          target[(k * ny + jmap[j]) * nx + imap[i]] = val;
+          const ti = imap[i], tj = jmap[j];
+          if (k === undefined || ti < 0 || tj < 0 || val !== val || val <= FILL_VALUE) return;
+          const idx = (k * ny + tj) * nx + ti;
+          sum[idx] += val;
+          count[idx]++;
         });
       }
     }
@@ -258,6 +288,13 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
     }
   }
   if (!grid) throw new Error('No data returned');
+  grid.data = {};
+  for (const p of params) {
+    const sum = grid.sum[p], count = grid.count[p];
+    grid.data[p] = sum.map((s, n) => (count[n] ? s / count[n] : NaN));
+  }
+  delete grid.sum;
+  delete grid.count;
   grid.requests = chunks.length;
   grid.scaleFixed = fixedResponses;
   return grid;

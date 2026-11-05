@@ -17,6 +17,10 @@ bbox 3,50.7,7.3,53.6) and draws a 4.5 kt isosurface (vertical scale ×2). Paste 
 
 ## Notes
 
+- **Presets.** The *Presets* section applies a complete view in one click. *Jet stream – full
+  domain* loads wind speed for the full model domain and all levels (horizontal step 4), as a
+  volume filled above 50 kt with vertical scale ×10. Presets are defined in the `PRESETS` list in `src/main.js`.
+
 - **Requests.** Levels are fetched 5 per request (`z=10/14`, `z=15/19`, …), 6 requests in
   parallel. *Levels / request* = 1 gives one request per level; a large value fetches the
   whole cube in one request.
@@ -29,9 +33,17 @@ bbox 3,50.7,7.3,53.6) and draws a 4.5 kt isosurface (vertical scale ×2). Paste 
 - **Isosurface / volume.** The threshold values can be drawn as marching-cubes isosurfaces,
   as a ray-marched volume (soft band around each value, or fill above/below the first value),
   or both.
+- **Full model domain.** The *Full model domain* button sets the bbox to the collection's
+  extent (≈ −42…39°E, 38…70°N, 676×564 points per level at the server's native spacing) and
+  loads it. *Horizontal step* `auto` averages blocks of n×n points while loading so each level
+  stays below ~100k points (2×2 for the full domain). Points outside the model domain come back as
+  `-9999` and are treated as missing. *Netherlands* switches back to the default bbox.
 - **Base map.** The bottom of the cube shows a GetMap image from the KNMI `baselayers` WMS
   (`https://geoservices.knmi.nl/wms?DATASET=baselayers`), requested in CRS:84 for the cube's
   bbox. Pick another layer or *None* under Appearance; vector borders are optional.
+- **Depth haze.** Data further from the viewer fades slightly towards a blue-grey haze
+  (Appearance → *Depth haze*, *Haze amount*). The fog range is fitted to the scene every frame,
+  so the effect looks the same at any zoom level; the volume applies it per ray sample.
 - Model level 1 is the model top (~14 hPa) and level 90 the lowest level near the surface.
 - Hover over a slice or isosurface to read the value, position, model level and (if loaded)
   pressure.
