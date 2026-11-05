@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EDR 3D Viewer</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+        "topojson-client": "https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/+esm"
+      }
+    }
+  </script>
+</head>
+<body>
+  <aside id="panel">
+    <header>
+      <h1>EDR 3D Viewer</h1>
+      <p class="sub">OGC API – EDR cube → WebGL isosurfaces</p>
+    </header>
+
+    <details open>
+      <summary>Data</summary>
+      <label class="stack">EDR cube URL
+        <textarea id="url" rows="4" spellcheck="false"></textarea>
+      </label>
+      <button id="applyUrl" class="primary">Apply URL &amp; load</button>
+
+      <label class="stack">Collection URL
+        <input id="collectionUrl" type="text" spellcheck="false">
+      </label>
+      <div class="row">
+        <label class="stack grow">Instance <select id="instance"></select></label>
+        <label class="stack grow">Time <select id="datetime"></select></label>
+      </div>
+      <label class="stack">Parameter <select id="parameter"></select></label>
+      <div class="grid4">
+        <label class="stack">West <input id="bboxW" type="number" step="0.1"></label>
+        <label class="stack">South <input id="bboxS" type="number" step="0.1"></label>
+        <label class="stack">East <input id="bboxE" type="number" step="0.1"></label>
+        <label class="stack">North <input id="bboxN" type="number" step="0.1"></label>
+      </div>
+      <div class="row">
+        <label class="stack grow">Level from <input id="levelFrom" type="number" min="1" value="10"></label>
+        <label class="stack grow">Level to <input id="levelTo" type="number" min="1" value="90"></label>
+      </div>
+      <label class="stack">Vertical coordinate
+        <select id="vmode">
+          <option value="level">Model level index (stretches boundary layer)</option>
+          <option value="pressure">Pressure altitude (ISA, loads air_pressure_ml)</option>
+        </select>
+      </label>
+      <div class="row">
+        <label class="stack grow" title="1 = one request per level; ≥ number of levels = everything in one request">Levels/req.
+          <input id="levelsPerRequest" type="number" min="1" max="200" value="5">
+        </label>
+        <label class="stack grow">Parallel
+          <input id="concurrency" type="number" min="1" max="16" value="6">
+        </label>
+        <label class="stack grow" title="The server currently returns levels 2..n of a multi-level response multiplied by 10">×10 fix
+          <select id="fixScale">
+            <option value="auto">auto</option>
+            <option value="on">on</option>
+            <option value="off">off</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <button id="load" class="primary grow">Load</button>
+        <button id="cancel" disabled>Cancel</button>
+      </div>
+      <progress id="progress" max="1" value="0"></progress>
+      <div id="status" class="status"></div>
+      <a id="requestUrl" class="request" target="_blank" rel="noopener"></a>
+    </details>
+
+    <details open>
+      <summary>Isosurface / volume</summary>
+      <label class="stack">Render threshold as
+        <select id="renderMode">
+          <option value="iso">Isosurface</option>
+          <option value="volume">Volume</option>
+          <option value="both">Isosurface + volume</option>
+        </select>
+      </label>
+      <div id="isoList"></div>
+      <div class="row">
+        <button id="addIso">+ Add isosurface</button>
+      </div>
+      <label class="slider">Surface opacity <input id="isoOpacity" type="range" min="0.1" max="1" step="0.05" value="0.85"><output></output></label>
+      <div id="volumeOpts" hidden>
+        <label class="stack">Volume style
+          <select id="volStyle">
+            <option value="2">Soft band around each value</option>
+            <option value="0">Fill above first value</option>
+            <option value="1" selected>Fill below first value</option>
+          </select>
+        </label>
+        <label class="stack">Volume colour
+          <select id="volColor">
+            <option value="iso">Isosurface colours</option>
+            <option value="cmap">Colour map</option>
+          </select>
+        </label>
+        <label class="slider">Width <input id="volWidth" type="range" min="0.1" max="10" step="0.1" value="1.5"><output></output></label>
+        <label class="slider">Density <input id="volDensity" type="range" min="-1.3" max="1.3" step="0.01" value="0"><output></output></label>
+        <label class="slider">Quality <input id="volSteps" type="range" min="64" max="768" step="32" value="320"><output></output></label>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Slices</summary>
+      <div class="slice">
+        <label class="check"><input id="sliceZOn" type="checkbox" checked> Horizontal</label>
+        <input id="sliceZ" type="range" min="0" max="0" step="1"><output id="sliceZOut"></output>
+      </div>
+      <div class="slice">
+        <label class="check"><input id="sliceXOn" type="checkbox"> Along lon</label>
+        <input id="sliceX" type="range" min="0" max="0" step="1"><output id="sliceXOut"></output>
+      </div>
+      <div class="slice">
+        <label class="check"><input id="sliceYOn" type="checkbox"> Along lat</label>
+        <input id="sliceY" type="range" min="0" max="0" step="1"><output id="sliceYOut"></output>
+      </div>
+      <label class="slider">Opacity <input id="sliceOpacity" type="range" min="0.1" max="1" step="0.05" value="0.9"><output></output></label>
+      <div class="row">
+        <label class="check"><input id="contoursOn" type="checkbox" checked> Contour lines every</label>
+        <input id="contourInterval" type="number" min="0.1" step="0.5" value="2" class="narrow">
+      </div>
+      <label class="check"><input id="isoLinesOn" type="checkbox" checked> Mark isosurface values on slices</label>
+    </details>
+
+    <details open>
+      <summary>Appearance</summary>
+      <label class="stack">Colour map <select id="colormap"></select></label>
+      <canvas id="colorbar" width="300" height="14"></canvas>
+      <div class="row cbar-labels"><span id="cbarMin"></span><span id="cbarUnit"></span><span id="cbarMax"></span></div>
+      <div class="row">
+        <label class="check"><input id="autoRange" type="checkbox" checked> Auto range</label>
+        <input id="rangeMin" type="number" step="0.5" class="narrow" disabled>
+        <input id="rangeMax" type="number" step="0.5" class="narrow" disabled>
+      </div>
+      <label class="slider">Vertical scale <input id="vscale" type="range" min="-1" max="1.5" step="any" value="0.30103"><output></output></label>
+      <div class="row wrap">
+        <label class="check"><input id="bordersOn" type="checkbox" checked> Borders</label>
+        <label class="check"><input id="boxOn" type="checkbox" checked> Box</label>
+        <label class="check"><input id="labelsOn" type="checkbox" checked> Labels</label>
+      </div>
+      <button id="resetView">Reset view</button>
+    </details>
+  </aside>
+
+  <main id="view">
+    <canvas id="c"></canvas>
+    <div id="hud"></div>
+    <div id="tooltip" hidden></div>
+    <div id="overlay" hidden>
+      <div class="loader">
+        <div class="spinner"></div>
+        <div id="loadTitle" class="load-title">Loading…</div>
+        <div class="bar"><div id="loadBar"></div></div>
+        <div id="loadDetail" class="load-detail"></div>
+        <button id="cancel2">Cancel</button>
+      </div>
+    </div>
+  </main>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
