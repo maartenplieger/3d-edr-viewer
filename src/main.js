@@ -9,6 +9,7 @@ import { resampleVolume, createVolumeMaterial, createVolumeTexture, updateVolume
 const DEFAULT_URL =
   'https://geoservices.knmi.nl/edr/collections/uwcw-ha-det-dini-5p5km.ml/instances/202611051800/cube' +
   '?bbox=3,50.7,7.3,53.6&z=10/90&datetime=2026-11-05T21:00:00Z&parameter-name=wind_speed_ml';
+const WMS_URL = 'https://geoservices.knmi.nl/wms?DATASET=baselayers&';
 const BORDERS_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-10m.json';
 const PRESSURE_PARAM = 'air_pressure_ml';
 const KM_SCALE = 5; // world units per km of altitude in pressure-altitude mode
@@ -25,6 +26,7 @@ const state = {
   borders: null, // [[ [lon, lat], ... ], ...]
   abort: null,
   volume: null, // { mesh, tex }
+  mapTex: null, // { url, promise, tex } cached WMS base map texture
 };
 
 // ---------------------------------------------------------------- scene
@@ -55,7 +57,8 @@ const sliceGroup = new THREE.Group();
 const mapGroup = new THREE.Group();
 const boxGroup = new THREE.Group();
 const volumeGroup = new THREE.Group();
-dataGroup.add(isoGroup, sliceGroup, mapGroup, boxGroup, volumeGroup);
+const groundGroup = new THREE.Group();
+dataGroup.add(isoGroup, sliceGroup, mapGroup, boxGroup, volumeGroup, groundGroup);
 const labelGroup = new THREE.Group(); // kept unscaled so text is not stretched
 scene.add(dataGroup, labelGroup);
 
@@ -192,7 +195,7 @@ function disposeChildren(group) {
     group.remove(o);
     o.geometry?.dispose();
     if (o.material && o.material !== sliceMaterial) {
-      o.material.map?.dispose();
+      if (o.material.map !== state.mapTex?.tex) o.material.map?.dispose();
       o.material.dispose();
     }
   }
@@ -433,6 +436,7 @@ function rebuildAll() {
   updateColormap();
   buildBox();
   buildBorders();
+  buildGround();
   buildSlices();
   for (const iso of state.isos) buildIso(iso);
   buildVolume();
@@ -479,12 +483,38 @@ function applyRenderMode() {
 
 function updateVolumeSettings() {
   volumeUniforms.style.value = Number($('volStyle').value);
-  volumeUniforms.useCmap.value = $('volColor').value === 'cmap' ? 1 : 0;
   volumeUniforms.width.value = Number($('volWidth').value);
   const density = 10 ** Number($('volDensity').value); // log slider, 0.05 … 20
   volumeUniforms.density.value = density;
   $('volDensity').nextElementSibling.textContent = density.toFixed(density < 1 ? 2 : 1);
   volumeUniforms.steps.value = Number($('volSteps').value);
+  updateVolumeColors();
+}
+
+// Colour-map range of the volume: the colour-bar range, or stretched over the values it fills.
+function volumeColorRange() {
+  const g = state.grid;
+  const vis = state.isos.filter((i) => i.visible).slice(0, MAX_ISO_LINES);
+  const lo = Number($('rangeMin').value), hi = Number($('rangeMax').value);
+  if ($('volColor').value !== 'fit' || !g || !vis.length) return [lo, hi];
+  const style = Number($('volStyle').value), w = Number($('volWidth').value), t = vis[0].value;
+  if (style === 1) return [g.min, t];
+  if (style === 0) return [t, g.max];
+  const vals = vis.map((i) => i.value);
+  return [Math.min(...vals) - 1.5 * w, Math.max(...vals) + 1.5 * w];
+}
+
+function updateVolumeColors() {
+  const mode = $('volColor').value;
+  const [lo, hi] = volumeColorRange();
+  volumeUniforms.useCmap.value = mode === 'iso' ? 0 : 1;
+  volumeUniforms.cmin.value = lo;
+  volumeUniforms.cmax.value = hi;
+  $('volCbarWrap').hidden = mode === 'iso';
+  drawColorbar($('volColorbar'), $('colormap').value);
+  $('volCbarMin').textContent = fmt(lo, 1);
+  $('volCbarMax').textContent = fmt(hi, 1);
+  $('volCbarUnit').textContent = state.grid?.unit || '';
 }
 
 function buildBox() {
@@ -518,14 +548,6 @@ function buildBorders() {
   const { lons, lats } = state.grid;
   const { lon0, lat0, kx, ky, zmin, px, py, ext } = state.geo;
   const z = zmin - ext * 0.002;
-
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(px.at(-1) - px[0], py.at(-1) - py[0]),
-    new THREE.MeshBasicMaterial({ color: 0x18212b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }),
-  );
-  ground.position.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, z - ext * 0.001);
-  mapGroup.add(ground);
-
   if (state.borders) {
     const rect = [lons[0], lats[0], lons.at(-1), lats.at(-1)];
     const pts = [];
@@ -540,6 +562,78 @@ function buildBorders() {
     mapGroup.add(new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0xc8d3de })));
   }
   mapGroup.visible = $('bordersOn').checked;
+}
+
+// ---------------------------------------------------------------- WMS base map
+
+function getMapTexture(url) {
+  if (state.mapTex?.url === url) return state.mapTex.promise;
+  state.mapTex?.tex?.dispose();
+  const entry = { url, tex: null };
+  entry.promise = new THREE.TextureLoader().loadAsync(url)
+    .then((tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      entry.tex = tex;
+      return tex;
+    })
+    .catch((e) => {
+      console.warn('Base map could not be loaded', e);
+      if (state.mapTex === entry) state.mapTex = null;
+      return null;
+    });
+  state.mapTex = entry;
+  return entry.promise;
+}
+
+// Ground plane under the cube, textured with a WMS GetMap image in CRS:84 (plain lon/lat, which
+// maps linearly onto the scene's x/y).
+function buildGround() {
+  disposeChildren(groundGroup);
+  if (!state.grid) return;
+  const { lons, lats } = state.grid;
+  const { px, py, zmin, ext } = state.geo;
+  const w = px.at(-1) - px[0], h = py.at(-1) - py[0];
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x18212b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
+  });
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  ground.position.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, zmin - ext * 0.003);
+  groundGroup.add(ground);
+
+  const layer = $('baseLayer').value;
+  if (!layer) return;
+  const iw = 1536, ih = Math.min(2048, Math.round((iw * h) / w));
+  const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${encodeURIComponent(layer)}&STYLES=` +
+    `&CRS=CRS:84&BBOX=${lons[0]},${lats[0]},${lons.at(-1)},${lats.at(-1)}` +
+    `&WIDTH=${iw}&HEIGHT=${ih}&FORMAT=image/png&TRANSPARENT=FALSE`;
+  getMapTexture(url).then((tex) => {
+    if (!tex || ground.parent !== groundGroup) return;
+    mat.map = tex;
+    mat.color.setScalar(Number($('mapBrightness').value));
+    mat.needsUpdate = true;
+  });
+}
+
+async function loadBaseLayers() {
+  const sel = $('baseLayer');
+  let layers = [];
+  try {
+    const r = await fetch(`${WMS_URL}SERVICE=WMS&REQUEST=GetCapabilities`);
+    const doc = new DOMParser().parseFromString(await r.text(), 'text/xml');
+    const child = (el, tag) => [...el.children].find((c) => c.localName === tag)?.textContent;
+    layers = [...doc.getElementsByTagNameNS('*', 'Layer')]
+      .map((l) => ({ name: child(l, 'Name'), title: child(l, 'Title') }))
+      .filter((l) => l.name);
+  } catch (e) {
+    console.warn('Could not read baselayers capabilities', e);
+    return;
+  }
+  const current = sel.value;
+  sel.innerHTML = '';
+  sel.append(option('', 'None'));
+  for (const l of layers) sel.append(option(l.name, l.title && l.title !== l.name ? l.title : l.name));
+  sel.value = layers.some((l) => l.name === current) ? current : '';
 }
 
 async function loadBorders() {
@@ -746,6 +840,7 @@ function drawCbar() {
   $('cbarMin').textContent = fmt(lo, 1);
   $('cbarMax').textContent = fmt(hi, 1);
   $('cbarUnit').textContent = state.grid?.unit || '';
+  updateVolumeColors();
 }
 
 function makeLabel(text, height) {
@@ -879,7 +974,7 @@ canvas.addEventListener('pointerleave', () => ($('tooltip').hidden = true));
 
 for (const name of COLORMAP_NAMES) $('colormap').append(option(name, name));
 
-for (const id of ['isoOpacity', 'sliceOpacity', 'volWidth', 'volSteps']) {
+for (const id of ['isoOpacity', 'sliceOpacity', 'volWidth', 'volSteps', 'mapBrightness']) {
   const el = $(id), out = el.nextElementSibling;
   const show = () => (out.textContent = Number(el.step) >= 1 ? el.value : Number(el.value).toFixed(2));
   el.addEventListener('input', show);
@@ -940,6 +1035,11 @@ $('autoRange').addEventListener('change', () => {
 });
 $('vscale').addEventListener('input', applyVScale);
 $('bordersOn').addEventListener('change', () => (mapGroup.visible = $('bordersOn').checked));
+$('baseLayer').addEventListener('change', buildGround);
+$('mapBrightness').addEventListener('input', () => {
+  const mat = groundGroup.children[0]?.material;
+  if (mat?.map) mat.color.setScalar(Number($('mapBrightness').value));
+});
 $('boxOn').addEventListener('change', () => (boxGroup.visible = $('boxOn').checked));
 $('labelsOn').addEventListener('change', () => (labelGroup.visible = $('labelsOn').checked));
 $('resetView').addEventListener('click', fitCamera);
@@ -949,7 +1049,9 @@ $('resetView').addEventListener('click', fitCamera);
 $('url').value = DEFAULT_URL;
 addIso(4.5, '#ff8c1a');
 updateVolumeSettings();
+applyRenderMode();
 applyVScale();
 updateColormap();
 loadBorders();
+loadBaseLayers();
 applyUrl();

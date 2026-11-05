@@ -82,7 +82,7 @@
       <label class="stack">Render threshold as
         <select id="renderMode">
           <option value="iso">Isosurface</option>
-          <option value="volume">Volume</option>
+          <option value="volume" selected>Volume</option>
           <option value="both">Isosurface + volume</option>
         </select>
       </label>
@@ -101,10 +101,15 @@
         </label>
         <label class="stack">Volume colour
           <select id="volColor">
+            <option value="fit" selected>Colour map, stretched to filled range</option>
+            <option value="cmap">Colour map, colour-bar range</option>
             <option value="iso">Isosurface colours</option>
-            <option value="cmap">Colour map</option>
           </select>
         </label>
+        <div id="volCbarWrap">
+          <canvas id="volColorbar" width="300" height="10"></canvas>
+          <div class="row cbar-labels"><span id="volCbarMin"></span><span id="volCbarUnit"></span><span id="volCbarMax"></span></div>
+        </div>
         <label class="slider">Width <input id="volWidth" type="range" min="0.1" max="10" step="0.1" value="1.5"><output></output></label>
         <label class="slider">Density <input id="volDensity" type="range" min="-1.3" max="1.3" step="0.01" value="0"><output></output></label>
         <label class="slider">Quality <input id="volSteps" type="range" min="64" max="768" step="32" value="320"><output></output></label>
@@ -114,7 +119,7 @@
     <details open>
       <summary>Slices</summary>
       <div class="slice">
-        <label class="check"><input id="sliceZOn" type="checkbox" checked> Horizontal</label>
+        <label class="check"><input id="sliceZOn" type="checkbox"> Horizontal</label>
         <input id="sliceZ" type="range" min="0" max="0" step="1"><output id="sliceZOut"></output>
       </div>
       <div class="slice">
@@ -143,9 +148,15 @@
         <input id="rangeMin" type="number" step="0.5" class="narrow" disabled>
         <input id="rangeMax" type="number" step="0.5" class="narrow" disabled>
       </div>
+      <label class="stack">Base map (KNMI baselayers WMS)
+        <select id="baseLayer">
+          <option value="knmi_animated_gif_background_europe_elevation_1km_combined" selected>Europe elevation 1km combined</option>
+        </select>
+      </label>
+      <label class="slider">Map brightness <input id="mapBrightness" type="range" min="0.2" max="1" step="0.05" value="0.75"><output></output></label>
       <label class="slider">Vertical scale <input id="vscale" type="range" min="-1" max="1.5" step="any" value="0.30103"><output></output></label>
       <div class="row wrap">
-        <label class="check"><input id="bordersOn" type="checkbox" checked> Borders</label>
+        <label class="check"><input id="bordersOn" type="checkbox"> Vector borders</label>
         <label class="check"><input id="boxOn" type="checkbox" checked> Box</label>
         <label class="check"><input id="labelsOn" type="checkbox" checked> Labels</label>
       </div>

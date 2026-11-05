@@ -55,6 +55,8 @@ export function createVolumeMaterial(shared) {
     density: { value: 1 },
     steps: { value: 320 },
     useCmap: { value: 0 },
+    cmin: { value: 0 }, // colour-map range of the volume
+    cmax: { value: 1 },
   };
   return new THREE.ShaderMaterial({
     uniforms,
@@ -75,7 +77,7 @@ export function createVolumeMaterial(shared) {
       uniform sampler3D vol;
       uniform sampler2D cmap;
       uniform vec3 texSize;
-      uniform float vmin, vmax, width, density, steps, useCmap, isoCount;
+      uniform float cmin, cmax, width, density, steps, useCmap, isoCount;
       uniform int style;
       uniform float isoValues[4];
       uniform vec3 isoColors[4];
@@ -92,7 +94,7 @@ export function createVolumeMaterial(shared) {
         return texture(vol, (p * (texSize - 1.0) + 0.5) / texSize).r;
       }
       vec3 cmapColor(float v) {
-        return texture(cmap, vec2(clamp((v - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0), 0.5)).rgb;
+        return texture(cmap, vec2(clamp((v - cmin) / max(cmax - cmin, 1e-6), 0.0, 1.0), 0.5)).rgb;
       }
       // Opacity (0..1) and colour of the transfer function at value v.
       float transfer(float v, out vec3 col) {

@@ -29,6 +29,9 @@ bbox 3,50.7,7.3,53.6) and draws a 4.5 kt isosurface (vertical scale ×2). Paste 
 - **Isosurface / volume.** The threshold values can be drawn as marching-cubes isosurfaces,
   as a ray-marched volume (soft band around each value, or fill above/below the first value),
   or both.
+- **Base map.** The bottom of the cube shows a GetMap image from the KNMI `baselayers` WMS
+  (`https://geoservices.knmi.nl/wms?DATASET=baselayers`), requested in CRS:84 for the cube's
+  bbox. Pick another layer or *None* under Appearance; vector borders are optional.
 - Model level 1 is the model top (~14 hPa) and level 90 the lowest level near the surface.
 - Hover over a slice or isosurface to read the value, position, model level and (if loaded)
   pressure.
