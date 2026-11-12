@@ -70,6 +70,9 @@
           </select>
         </label>
       </div>
+      <label class="stack" title="Points in x and y that the server resamples the data to (EDR resolution-x / resolution-y), for servers that support it, e.g. when the native grid is too large for one request. Empty: the server's own grid.">Server resolution (x × y points)
+        <input id="serverResolution" type="text" placeholder="the server's own grid, e.g. 300x300" spellcheck="false">
+      </label>
       <div class="row">
         <label class="stack grow">Level from <input id="levelFrom" type="number" min="1" value="1"></label>
         <label class="stack grow">Level to <input id="levelTo" type="number" min="1" value="90"></label>

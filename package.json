@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "WebGL (three.js) viewer for OGC API – EDR cube queries: isosurfaces, volumes and streamlines",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

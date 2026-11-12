@@ -1,0 +1,11 @@
+EDR 3D Viewer
+Copyright 2026 Maarten Plieger
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes the marching cubes lookup tables (src/mctables.js) from three.js
+(https://threejs.org, examples/jsm/objects/MarchingCubes.js), Copyright 2010-2024 three.js authors,
+licensed under the MIT License.
+
+The built application bundles three.js (MIT License, Copyright 2010-2024 three.js authors) and
+topojson-client (ISC License, Copyright 2012-2019 Michael Bostock).

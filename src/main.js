@@ -15,21 +15,22 @@ const WMS_URL = 'https://geoservices.knmi.nl/wms?DATASET=baselayers&';
 const BORDERS_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-10m.json';
 
 // Derived parameter: wind speed with the wind direction, for streamlines. Offered when a collection has both
-// wind_speed… and wind_from_direction… (any separator, same suffix).
+// wind_speed… and wind_from_direction… or wind_direction… (any separator, same suffix); the direction is where
+// the wind comes from, as usual in meteorology.
 const WIND_OPTION = '__wind__';
 function windPairOf(collection) {
   const ids = Object.keys(collection?.parameter_names || {});
   for (const speed of ids) {
     const m = /^wind([-_])speed(.*)$/i.exec(speed);
     if (!m) continue;
-    const dir = ids.find((id) => new RegExp(`^wind[-_]from[-_]direction${m[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i').test(id));
+    const dir = ids.find((id) => new RegExp(`^wind[-_](from[-_])?direction${m[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i').test(id));
     if (dir) return { speed, dir };
   }
   return null;
 }
 
-// Vertical coordinate of a collection. EDR gives no usable CRS for it here (vrs 'customvrs'), so it is told
-// from the names: …pl → pressure levels (hPa), …hagl/…height → height above ground (m), otherwise model
+// Vertical coordinate of a collection: from its VERTCRS when the server gives one, otherwise (adaguc gives
+// 'customvrs') from the names: …pl → pressure levels (hPa), …hagl/…height → height above ground (m), otherwise model
 // levels (1 = top). Level values are ordered top first, as the scene expects (k = 0 is the highest level).
 const VERTICAL_KINDS = {
   level: { label: 'model levels', unit: '', text: (v) => `L${v}` },
@@ -37,6 +38,12 @@ const VERTICAL_KINDS = {
   height: { label: 'heights', unit: 'm', text: (v) => `${v} m` },
 };
 function verticalKindOf(collection) {
+  // A real vertical CRS (e.g. VERTCRS["Atmospheric pressure",…,UNIT["hPa",100]]) says it directly
+  const vrs = String(collection?.extent?.vertical?.vrs || '').toLowerCase();
+  if (/vertcrs/.test(vrs)) {
+    if (/pressure|hpa/.test(vrs)) return 'pressure';
+    if (/height|altitude|metre|meter/.test(vrs)) return 'height';
+  }
   const names = [collection?.id || '', ...Object.keys(collection?.parameter_names || {})].join(' ').toLowerCase();
   if (/(^|[._\s-])pl(\b|$)/.test(names)) return 'pressure';
   if (/(^|[._\s-])(a?hagl|height)(\b|$)/.test(names)) return 'height';
@@ -58,23 +65,46 @@ const pressureParamOf = (collection) =>
 // bbox: 'full' = model domain extent, or [W, S, E, N]; levels: 'all' or [from, to];
 // stride: horizontal step ('auto' or 1–4); levelStep: vertical step (every n-th level, 1–5); gridCells: draw the grid cells;
 // sky / earth: sky with horizon and stars, earth surface around the data;
-// threshold sets the first isosurface value (also the volume's fill threshold); density: volume density (0.05–20).
+// threshold sets the first isosurface value (also the volume's fill threshold); density: volume density (0.05–20);
+// resolution: [x, y] points the server resamples to (EDR resolution-x/-y), for servers with a size limit;
+// levelsPerRequest: levels per cube request.
 const PRESETS = [
   {
-    name: 'Jet stream – full domain',
-    description: 'Wind speed, every 4th level, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
+    name: 'Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)',
+    description: 'KNMI UWCW HARMONIE DINI 5.5 km from geoservices.knmi.nl: wind speed on the full domain, every 4th model level from level 4, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
     collectionUrl: DEFAULT_COLLECTION,
     crs: '',
     bbox: 'full',
     stride: '4', // horizontal step: 'auto' or 1–4
     levelStep: 4,
+    levelsPerRequest: 8,
     parameter: 'wind_speed_ml',
-    levels: 'all',
+    levels: [4, 90], // from level 4: the levels above are near the model top
     renderMode: 'volume',
     volStyle: '0', // 0 = fill above, 1 = fill below, 2 = band
     threshold: 50,
     density: 2.2,
     vscale: 10,
+    sky: true,
+    earth: true,
+  },
+  {
+    name: 'Jet stream – Nordic (MEPS, meteocore)',
+    description: 'MEPS forecast from FMI meteocore: wind speed on 13 pressure levels (1000–50 hPa) at their height, resampled by the server to 300×300 points, volume filled above 25 m/s (≈ 50 kt), vertical scale ×15',
+    collectionUrl: 'https://meteocore.app.meteo.fi/edr/collections/meps-netcdf-pressure',
+    crs: '',
+    bbox: 'full',
+    stride: '1', // the server already resamples
+    levelStep: 1,
+    resolution: [300, 300], // the full domain at the native 2.5 km grid is over the server's limit of 1 M values per request
+    levelsPerRequest: 5, // 5 × 300 × 300 points × 2 values = 900 k, within the limit
+    parameter: 'wind_speed_pl',
+    levels: 'all',
+    renderMode: 'volume',
+    volStyle: '0',
+    threshold: 25,
+    density: 2.2,
+    vscale: 15,
     sky: true,
     earth: true,
   },
@@ -734,10 +764,20 @@ function buildRequest(datetime = $('datetime').value) {
     fixScale: $('fixScale').value,
     concurrency: Number($('concurrency').value) || 6,
     angleParams: wind ? [wind.dir] : [], // averaged as unit vectors with a horizontal step
+    resolution: serverResolution(),
   };
   const vkind = vertical.kind, vmodeUsed = vkind === 'level' ? vmode : 'level';
   const meta = { param, selection, wind, vmode: vmodeUsed, vkind, pressureParam, crs, proj, unit: paramUnit(param), datetime, instance: opts.instance };
-  return { opts, meta, key: JSON.stringify([opts.collectionUrl, opts.instance, datetime, opts.bbox, opts.crs, levels, params, opts.stride, opts.fixScale, vmodeUsed]) };
+  return { opts, meta, key: JSON.stringify([opts.collectionUrl, opts.instance, datetime, opts.bbox, opts.crs, levels, params, opts.stride, opts.resolution, opts.fixScale, vmodeUsed]) };
+}
+
+// "300x300" (or "300 × 300", "300,300") → [300, 300]; empty → null (the server's own grid)
+function serverResolution() {
+  const text = $('serverResolution').value.trim();
+  if (!text) return null;
+  const m = /^(\d+)\s*[x×*, ]\s*(\d+)$/i.exec(text);
+  if (!m || +m[1] < 2 || +m[2] < 2) throw new Error(`Server resolution "${text}": use e.g. 300x300, or leave it empty`);
+  return [+m[1], +m[2]];
 }
 
 // Loaded cubes, so animating or stepping back to a time does not load it again. Oldest used are dropped first.
@@ -2020,6 +2060,8 @@ async function applyPreset(p) {
   }
   if (p.stride != null) $('stride').value = String(p.stride);
   if (p.levelStep != null) $('levelStep').value = String(p.levelStep);
+  if (p.levelsPerRequest != null) $('levelsPerRequest').value = p.levelsPerRequest;
+  $('serverResolution').value = p.resolution ? p.resolution.join('x') : ''; // presets without it use the server's grid
   if (p.gridCells != null) $('gridOn').checked = p.gridCells; // drawn when the data is shown
   if (p.earth != null) $('earthOn').checked = p.earth;
   if (p.sky != null) {

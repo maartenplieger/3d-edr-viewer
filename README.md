@@ -3,6 +3,9 @@
 Single-page WebGL (three.js) viewer for OGC API – EDR `cube` queries returning CoverageJSON.
 
 **Live:** https://maartenplieger.github.io/3d-edr-viewer/ · **Source:** https://github.com/maartenplieger/3d-edr-viewer
+
+![The jet stream over Europe from the KNMI HARMONIE DINI model: wind speed above 50 kt as a volume, with streamlines of the derived wind, above the base map and the earth surface](docs/screenshot.png)
+
 Controls on the left, 3D view on the right. Isosurfaces are computed in the browser with
 marching cubes; slices are coloured with a colour map and contour lines.
 
@@ -21,8 +24,8 @@ npm run preview   # serve dist/ at http://localhost:8765 to check the build
 topojson-client come from npm (`package.json`); the coastline/border data and the base maps are fetched at
 run time.
 
-On startup it applies the first preset, *Jet stream – full domain*: KNMI UWCW HARMONIE model-level wind
-speed for the latest run over the full model domain (every 4th level, 4×4 averaged), as a volume filled
+On startup it applies the first preset, *Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)*: KNMI UWCW HARMONIE model-level wind
+speed for the latest run over the full model domain (every 4th level from level 4, 4×4 averaged), as a volume filled
 above 50 kt with vertical scale ×10. To use other data, enter an EDR
 endpoint (e.g. `https://geoservices.knmi.nl/edr`) or a collection URL (`…/edr/collections/{id}`) at the top of
 the **Data** panel and press Enter or *Open*. An endpoint lists all its collections with at least two levels
@@ -82,9 +85,19 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   around the data* continues the base map over about seven times the data area, with faint degree lines, as a
   reference for height and motion when flying low. The preset switches both on.
 - **Presets.** The *Presets* section applies a complete view in one click; the first one is also the start
-  view. *Jet stream – full domain* loads wind speed for the full model domain, every 4th level (horizontal
-  step 4), as a volume filled above 50 kt with vertical scale ×10, with the sky and the earth surface on.
-  Presets are defined in the `PRESETS` list in `src/main.js`.
+  view. Presets are defined in the `PRESETS` list in `src/main.js`.
+  - *Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)*: KNMI UWCW HARMONIE DINI from
+    `geoservices.knmi.nl`, wind speed on the full model domain, every 4th model level from level 4 (8 levels
+    per request), 4×4 averaged, as a
+    volume filled above 50 kt with vertical scale ×10, with the sky and the earth surface on.
+  - *Jet stream – Nordic (MEPS, meteocore)*: the MEPS forecast from FMI's meteocore
+    (`https://meteocore.app.meteo.fi/edr`), wind speed on 13 pressure levels (1000–50 hPa) at their height,
+    filled above 25 m/s (≈ 50 kt) with vertical scale ×15. The full domain at the native 2.5 km grid is over
+    meteocore's limit of a million values per request, so the server resamples it to 300×300 points.
+- **Server resolution.** *Server resolution* (e.g. `300x300`) asks the server to resample the data to that
+  many points in x and y (EDR `resolution-x` / `resolution-y`), for servers that support it; empty uses the
+  server's own grid. Unlike the horizontal step, which averages after downloading, this makes the requests
+  smaller, which servers with a size limit need for large areas.
 
 - **Native grid.** When a collection lists a rotated pole CRS in the cube's `crs_details` (adaguc-server
   with `crs=native`), the *Grid* selector offers it and uses it by default. The cube then comes back on the
@@ -134,3 +147,9 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - `src/main.js` – scene, UI wiring, slices, labels, picking
 - `public/favicon.svg` – the icon: the ADAGUC globe seen from space, with a data cube and a jet stream
 - `vite.config.js` – dev server and build settings
+
+## Licence
+
+Copyright 2026 Maarten Plieger. Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE)
+for the third-party parts: the marching cubes tables from three.js (MIT), and the bundled three.js (MIT) and
+topojson-client (ISC).

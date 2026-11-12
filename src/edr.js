@@ -90,13 +90,15 @@ export function parseCubeUrl(str) {
 }
 
 // bbox is in the coordinates of crs (EDR §8.2.4): lon/lat without crs, rotated degrees for a native rotated pole grid.
-export function buildCubeUrl({ collectionUrl, instance, bbox, datetime, params, z, crs }) {
+// resolution: [x, y] points the server resamples to (EDR resolution-x / resolution-y), for servers that support it
+export function buildCubeUrl({ collectionUrl, instance, bbox, datetime, params, z, crs, resolution }) {
   const base = collectionUrl.replace(/\/+$/, '') +
     (instance ? `/instances/${encodeURIComponent(instance)}` : '') + '/cube';
   const q = [`bbox=${bbox.join(',')}`, `z=${z}`];
   if (datetime) q.push(`datetime=${datetime}`);
   q.push(`parameter-name=${params.join(',')}`);
   if (crs) q.push(`crs=${encodeURIComponent(crs)}`);
+  if (resolution) q.push(`resolution-x=${resolution[0]}`, `resolution-y=${resolution[1]}`);
   return `${base}?${q.join('&')}`;
 }
 
