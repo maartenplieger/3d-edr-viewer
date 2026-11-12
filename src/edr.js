@@ -85,15 +85,18 @@ export function parseCubeUrl(str) {
   if (p.get('datetime')) out.datetime = p.get('datetime');
   if (p.get('parameter-name')) out.parameter = p.get('parameter-name').split(',')[0];
   if (p.get('z')) out.levels = parseZ(p.get('z'));
+  if (p.get('crs')) out.crs = p.get('crs');
   return out;
 }
 
-export function buildCubeUrl({ collectionUrl, instance, bbox, datetime, params, z }) {
+// bbox is in the coordinates of crs (EDR §8.2.4): lon/lat without crs, rotated degrees for a native rotated pole grid.
+export function buildCubeUrl({ collectionUrl, instance, bbox, datetime, params, z, crs }) {
   const base = collectionUrl.replace(/\/+$/, '') +
     (instance ? `/instances/${encodeURIComponent(instance)}` : '') + '/cube';
   const q = [`bbox=${bbox.join(',')}`, `z=${z}`];
   if (datetime) q.push(`datetime=${datetime}`);
   q.push(`parameter-name=${params.join(',')}`);
+  if (crs) q.push(`crs=${encodeURIComponent(crs)}`);
   return `${base}?${q.join('&')}`;
 }
 
@@ -169,19 +172,33 @@ function fixScaleBug(json, mode) {
 const MAX_POINTS_PER_LEVEL = 100000; // 'auto' horizontal step keeps levels below this size
 
 /**
- * Loads a 3D cube into a regular grid with lon/lat ascending and levels ascending.
+ * Loads a 3D cube into a regular grid with x/y ascending and levels ascending.
  * data[param][(k * ny + j) * nx + i]
+ * `lons`/`lats` hold the x/y axis values: lon/lat, or rotated lon/lat for a native rotated pole grid.
  *
  * `stride` ('auto' or n) averages n×n blocks of server grid points while ingesting, so large
  * areas such as the full model domain stay manageable.
- * Levels are fetched in chunks of `levelsPerRequest` (z=a/b), `concurrency` requests at a time.
+ * Levels are fetched in chunks of `levelsPerRequest`, `concurrency` requests at a time. `levels` lists the
+ * level values to load, top first (e.g. model levels 1, 2, …, or pressure levels 300, 500, 850); `allLevels`
+ * all values of the collection. A chunk of consecutive values is requested as a range (z=a/b), otherwise as a
+ * list (z=a,b,c). Without `levels`: every `levelStep`-th integer level from levelFrom to levelTo.
  * fixScale ('auto' | 'on' | 'off') controls the per-response ×10 correction, see fixScaleBug.
+ * angleParams: parameters that are directions in degrees; these are averaged as unit vectors.
  */
+const DEG = Math.PI / 180;
+
 export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
-  const levels = [];
-  for (let l = o.levelFrom; l <= o.levelTo; l++) levels.push(l);
+  // The level values to load (top first), or every levelStep-th integer level from levelFrom to levelTo
+  let levels = o.levels ? [...o.levels] : [];
+  if (!o.levels) {
+    const levelStep = Math.max(1, Math.round(o.levelStep) || 1);
+    for (let l = o.levelFrom; l <= o.levelTo; l += levelStep) levels.push(l);
+  }
+  // All level values of the collection, to tell whether a chunk is a consecutive run (a range request)
+  const allLevels = o.allLevels || levels;
   const levelIndex = new Map(levels.map((l, k) => [l, k]));
   const params = [...new Set(o.params)];
+  const angleParams = (o.angleParams || []).filter((p) => params.includes(p)); // directions in degrees
   let grid = null;
 
   // Maps source indices (server order) to averaged, ascending block indices; -1 = dropped edge.
@@ -218,23 +235,33 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
       jmap: by.map,
       sum: Object.fromEntries(params.map((p) => [p, new Float32Array(nx * ny * nz)])),
       count: Object.fromEntries(params.map((p) => [p, new Uint8Array(nx * ny * nz)])),
+      // Directions (degrees) are averaged as unit vectors: sum holds the sines, sumCos the cosines
+      sumCos: Object.fromEntries(angleParams.map((p) => [p, new Float32Array(nx * ny * nz)])),
     };
   };
 
+  let valuesRead = 0, valuesMissing = 0; // every value received from the server, and those without data
   const ingest = (json, fallbackLevel) => {
     for (const cov of coveragesOf(json)) {
       ensureGrid(cov.domain);
       const zv = axisValues(cov.domain.axes.z) ?? [fallbackLevel];
       const { nx, ny, imap, jmap } = grid;
       for (const [name, range] of Object.entries(cov.ranges)) {
-        const sum = grid.sum[name], count = grid.count[name];
+        const sum = grid.sum[name], count = grid.count[name], sumCos = grid.sumCos[name];
         if (!sum) continue;
         forEachValue(range, (kc, j, i, val) => {
+          valuesRead++;
+          if (val !== val || val <= FILL_VALUE) { valuesMissing++; return; }
           const k = levelIndex.get(Number(zv[kc]));
           const ti = imap[i], tj = jmap[j];
-          if (k === undefined || ti < 0 || tj < 0 || val !== val || val <= FILL_VALUE) return;
+          if (k === undefined || ti < 0 || tj < 0) return;
           const idx = (k * ny + tj) * nx + ti;
-          sum[idx] += val;
+          if (sumCos) {
+            sum[idx] += Math.sin(val * DEG);
+            sumCos[idx] += Math.cos(val * DEG);
+          } else {
+            sum[idx] += val;
+          }
           count[idx]++;
         });
       }
@@ -244,7 +271,15 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
   const size = Math.max(1, Math.round(o.levelsPerRequest) || levels.length);
   const chunks = [];
   for (let n = 0; n < levels.length; n += size) chunks.push(levels.slice(n, n + size));
-  const req = (c) => buildCubeUrl({ ...o, params, z: c.length === 1 ? `${c[0]}` : `${c[0]}/${c.at(-1)}` });
+  // A range (z=a/b) when the chunk is a consecutive run of the collection's levels, otherwise a list (z=a,b,c)
+  const position = new Map(allLevels.map((l, n) => [l, n]));
+  const consecutive = (c) => c.every((l, n) => n === 0 || position.get(l) === position.get(c[0]) + n);
+  const zOf = (c) => {
+    if (c.length === 1) return `${c[0]}`;
+    if (consecutive(c)) return `${Math.min(c[0], c.at(-1))}/${Math.max(c[0], c.at(-1))}`;
+    return c.join(',');
+  };
+  const req = (c) => buildCubeUrl({ ...o, params, z: zOf(c) });
   let fixedResponses = 0;
   const handle = (json, c) => {
     if (fixScaleBug(json, o.fixScale)) fixedResponses++;
@@ -290,12 +325,17 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
   if (!grid) throw new Error('No data returned');
   grid.data = {};
   for (const p of params) {
-    const sum = grid.sum[p], count = grid.count[p];
-    grid.data[p] = sum.map((s, n) => (count[n] ? s / count[n] : NaN));
+    const sum = grid.sum[p], count = grid.count[p], sumCos = grid.sumCos[p];
+    grid.data[p] = sumCos
+      ? sum.map((s, n) => (count[n] ? ((Math.atan2(s, sumCos[n]) / DEG) + 360) % 360 : NaN))
+      : sum.map((s, n) => (count[n] ? s / count[n] : NaN));
   }
   delete grid.sum;
   delete grid.count;
+  delete grid.sumCos;
   grid.requests = chunks.length;
+  grid.valuesRead = valuesRead;
+  grid.valuesMissing = valuesMissing;
   grid.scaleFixed = fixedResponses;
   return grid;
 }

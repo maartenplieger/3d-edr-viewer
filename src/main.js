@@ -5,35 +5,85 @@ import { fetchJSON, parseTemporalValues, parseCubeUrl, toIso, loadCube } from '.
 import { marchingCubes } from './isosurface.js';
 import { COLORMAP_NAMES, makeColormapTexture, drawColorbar, hexToRgb } from './colormaps.js';
 import { resampleVolume, createVolumeMaterial, createVolumeTexture, updateVolumeCamera } from './volume.js';
+import { nativeCubeCrs, bboxToRot, bboxToGeo } from './rotpole.js';
+import { Streamlines } from './streamlines.js';
 
-const DEFAULT_URL =
-  'https://geoservices.knmi.nl/edr/collections/uwcw-ha-det-dini-5p5km.ml/instances/202611051800/cube' +
-  '?bbox=3,50.7,7.3,53.6&z=10/90&datetime=2026-11-05T21:00:00Z&parameter-name=wind_speed_ml';
+// No instance or time: runs expire on the server, so startup takes the latest run and its first time
+const DEFAULT_COLLECTION = 'https://geoservices.knmi.nl/edr/collections/uwcw-ha-det-dini-5p5km.ml';
+const DEFAULT_URL = `${DEFAULT_COLLECTION}/cube?bbox=3,50.7,7.3,53.6&z=1/90&parameter-name=wind_speed_ml`;
 const WMS_URL = 'https://geoservices.knmi.nl/wms?DATASET=baselayers&';
 const BORDERS_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-10m.json';
-const PRESSURE_PARAM = 'air_pressure_ml';
 
-// One-click views. bbox: 'full' = model domain extent, or [W, S, E, N]; levels: 'all' or [from, to];
-// stride: horizontal step ('auto' or 1–4);
-// threshold sets the first isosurface value (also the volume's fill threshold).
+// Derived parameter: wind speed with the wind direction, for streamlines. Offered when a collection has both
+// wind_speed… and wind_from_direction… (any separator, same suffix).
+const WIND_OPTION = '__wind__';
+function windPairOf(collection) {
+  const ids = Object.keys(collection?.parameter_names || {});
+  for (const speed of ids) {
+    const m = /^wind([-_])speed(.*)$/i.exec(speed);
+    if (!m) continue;
+    const dir = ids.find((id) => new RegExp(`^wind[-_]from[-_]direction${m[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i').test(id));
+    if (dir) return { speed, dir };
+  }
+  return null;
+}
+
+// Vertical coordinate of a collection. EDR gives no usable CRS for it here (vrs 'customvrs'), so it is told
+// from the names: …pl → pressure levels (hPa), …hagl/…height → height above ground (m), otherwise model
+// levels (1 = top). Level values are ordered top first, as the scene expects (k = 0 is the highest level).
+const VERTICAL_KINDS = {
+  level: { label: 'model levels', unit: '', text: (v) => `L${v}` },
+  pressure: { label: 'pressure levels', unit: 'hPa', text: (v) => `${v} hPa` },
+  height: { label: 'heights', unit: 'm', text: (v) => `${v} m` },
+};
+function verticalKindOf(collection) {
+  const names = [collection?.id || '', ...Object.keys(collection?.parameter_names || {})].join(' ').toLowerCase();
+  if (/(^|[._\s-])pl(\b|$)/.test(names)) return 'pressure';
+  if (/(^|[._\s-])(a?hagl|height)(\b|$)/.test(names)) return 'height';
+  return 'level';
+}
+function verticalOf(collection) {
+  const kind = verticalKindOf(collection);
+  const values = [...new Set((collection?.extent?.vertical?.values || []).map(Number).filter(Number.isFinite))];
+  values.sort((a, b) => (kind === 'height' ? b - a : a - b)); // top first: low pressure / high above ground
+  return { kind, values, ...VERTICAL_KINDS[kind] };
+}
+
+// Pressure on model levels, named air_pressure_ml or air-pressure-ml depending on the server.
+const pressureParamOf = (collection) =>
+  Object.keys(collection?.parameter_names || {}).find((id) => /^air[-_]pressure[-_]ml$/.test(id)) || 'air_pressure_ml';
+
+// One-click views. collectionUrl: switch to this collection first (latest instance);
+// crs: 'native' = the model's own grid (when the collection offers it), otherwise EPSG:4326;
+// bbox: 'full' = model domain extent, or [W, S, E, N]; levels: 'all' or [from, to];
+// stride: horizontal step ('auto' or 1–4); levelStep: vertical step (every n-th level, 1–5); gridCells: draw the grid cells;
+// sky / earth: sky with horizon and stars, earth surface around the data;
+// threshold sets the first isosurface value (also the volume's fill threshold); density: volume density (0.05–20).
 const PRESETS = [
   {
     name: 'Jet stream – full domain',
-    description: 'Wind speed, all levels, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
+    description: 'Wind speed, every 4th level, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
+    collectionUrl: DEFAULT_COLLECTION,
+    crs: '',
     bbox: 'full',
     stride: '4', // horizontal step: 'auto' or 1–4
+    levelStep: 4,
     parameter: 'wind_speed_ml',
     levels: 'all',
     renderMode: 'volume',
     volStyle: '0', // 0 = fill above, 1 = fill below, 2 = band
     threshold: 50,
+    density: 2.2,
     vscale: 10,
+    sky: true,
+    earth: true,
   },
 ];
 const KM_SCALE = 5; // world units per km of altitude in pressure-altitude mode
 const MAX_ISO_LINES = 4;
 
 const $ = (id) => document.getElementById(id);
+let renderFrames = 3; // frames still to draw, see requestRender
 
 const state = {
   collection: null,
@@ -44,7 +94,7 @@ const state = {
   borders: null, // [[ [lon, lat], ... ], ...]
   abort: null,
   volume: null, // { mesh, tex }
-  mapTex: null, // { url, promise, tex } cached WMS base map texture
+  mapTex: {}, // slot ('ground', 'earth') → { url, promise, tex }: cached WMS base map textures
 };
 
 // ---------------------------------------------------------------- scene
@@ -61,6 +111,66 @@ const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 
 scene.add(new THREE.HemisphereLight(0xdde8ff, 0x2a3440, 1.4));
+
+// Optional sky as a reference while flying: a dome with a gradient towards the zenith, a faint line at the
+// true horizon, dark ground below it and stars above it. It moves with the camera, so it is infinitely far
+// away: flying does not get you closer, but turning, pitching and banking show against it. Drawn first,
+// behind everything else, and not affected by the depth haze.
+const skyGroup = new THREE.Group();
+skyGroup.visible = false;
+{
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 64, 32),
+    new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      depthTest: false,
+      vertexShader: /* glsl */ `
+        varying vec3 vDir;
+        void main() {
+          vDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: /* glsl */ `
+        varying vec3 vDir;
+        void main() {
+          float h = normalize(vDir).z; // sine of the elevation, z is up
+          vec3 zenith = vec3(0.012, 0.018, 0.040);
+          vec3 skyHorizon = vec3(0.150, 0.200, 0.270);
+          vec3 groundHorizon = vec3(0.105, 0.115, 0.125);
+          vec3 groundDeep = vec3(0.035, 0.040, 0.045);
+          vec3 c = h >= 0.0 ? mix(skyHorizon, zenith, pow(h, 0.4)) : mix(groundHorizon, groundDeep, pow(-h, 0.5));
+          c += vec3(0.30, 0.36, 0.42) * exp(-abs(h) * 160.0) * 0.55; // the horizon line
+          gl_FragColor = vec4(c, 1.0);
+        }`,
+    }),
+  );
+  dome.renderOrder = -20;
+  dome.frustumCulled = false;
+
+  // Stars in a fixed pattern (seeded), only above the horizon, brighter ones rarer
+  let seed = 12345;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const N = 2500, pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  for (let n = 0; n < N; n++) {
+    const z = 0.03 + 0.97 * Math.sqrt(rand()); // more towards the zenith than uniform, but also low stars
+    const r = Math.sqrt(1 - z * z), a = rand() * Math.PI * 2;
+    pos.set([r * Math.cos(a) * 0.98, r * Math.sin(a) * 0.98, z * 0.98], n * 3);
+    const b = 0.35 + 0.65 * rand() ** 3;
+    const tint = rand(); // a little blue or yellow
+    col.set([b * (0.9 + 0.1 * tint), b * 0.95, b * (1.0 - 0.1 * tint)], n * 3);
+  }
+  const starGeom = new THREE.BufferGeometry();
+  starGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  starGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const stars = new THREE.Points(starGeom, new THREE.PointsMaterial({
+    size: 1.8, sizeAttenuation: false, vertexColors: true, depthWrite: false, depthTest: false, fog: false,
+  }));
+  stars.renderOrder = -19;
+  stars.frustumCulled = false;
+  skyGroup.add(dome, stars);
+}
+scene.add(skyGroup);
 const sun = new THREE.DirectionalLight(0xffffff, 1.8);
 sun.position.set(-1, -1.5, 3);
 scene.add(sun);
@@ -76,7 +186,10 @@ const mapGroup = new THREE.Group();
 const boxGroup = new THREE.Group();
 const volumeGroup = new THREE.Group();
 const groundGroup = new THREE.Group();
-dataGroup.add(isoGroup, sliceGroup, mapGroup, boxGroup, volumeGroup, groundGroup);
+const gridGroup = new THREE.Group(); // the grid cells in use, see buildGridCells
+const earthGroup = new THREE.Group(); // the earth surface around the data, see buildEarth
+const streamlines = new Streamlines(4000); // moving with the derived wind, see buildStreamlines
+dataGroup.add(isoGroup, sliceGroup, mapGroup, boxGroup, volumeGroup, groundGroup, gridGroup, earthGroup, streamlines.object);
 const labelGroup = new THREE.Group(); // kept unscaled so text is not stretched
 scene.add(dataGroup, labelGroup);
 
@@ -153,6 +266,7 @@ new ResizeObserver(() => {
   renderer.setSize(w, h, false);
   camera.aspect = w / Math.max(h, 1);
   camera.updateProjectionMatrix();
+  requestRender();
 }).observe($('view'));
 
 let pickPending = false;
@@ -177,8 +291,203 @@ function updateHaze() {
   haze.far = haze.near + (2 * tmpSphere.radius) / Math.max(strength, 0.01);
 }
 
-renderer.setAnimationLoop(() => {
-  controls.update();
+// ---------------------------------------------------------------- keyboard flight
+// Flies like a plane, with inertia: W/S speed up/slow down along the nose (S past zero flies backwards), A/D
+// and Q/E push sideways and down/up, the arrow keys turn and pitch. After releasing the keys the plane keeps
+// cruising (the path follows the nose when turning); sideways and vertical drift and turning fade out.
+// Never fast: the top speed is low. Shift: 2× thrust and top speed. Space: stop everything at once.
+// Camera and orbit target move together, so mouse orbiting keeps working around the point ahead.
+
+const flyKeys = new Set();
+const FLY_CODES = new Set([
+  'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'Space',
+]);
+const FLY = {
+  maxSpeed: 0.15, // fraction of the scene extent per second, ×2 with Shift: never fast
+  accel: 0.12, // same unit, per second
+  driftDrag: 1.2, // per second: how fast sideways/vertical motion fades without a key
+  forwardDrag: 0, // per second: the forward speed is kept until you brake (S) or stop (Space)
+  maxTurn: THREE.MathUtils.degToRad(25), // per second: calm turns
+  turnAccel: THREE.MathUtils.degToRad(50), // per second²: a short tap is a small correction
+  turnDrag: 3, // per second: turning fades quickly but smoothly after releasing a key
+};
+const flight = { forward: 0, side: 0, vertical: 0, yaw: 0, pitch: 0 }; // speeds: world units/s and rad/s
+const flyClock = new THREE.Clock();
+const flyTmp = { dir: new THREE.Vector3(), right: new THREE.Vector3(), move: new THREE.Vector3(), up: new THREE.Vector3(0, 0, 1) };
+
+const stopFlight = () => Object.keys(flight).forEach((key) => (flight[key] = 0));
+
+// Attitude, like a plane: bank into a turn (and lift the nose a little, as a turning plane pulls up), nose up
+// when climbing and down when descending. Only the view rotates; the flight path is not changed by it.
+const ATTITUDE = {
+  maxBank: THREE.MathUtils.degToRad(35),
+  maxNose: THREE.MathUtils.degToRad(10),
+  turnNose: 0.25, // nose up per radian of bank
+  response: 3, // per second: how fast the attitude follows the turn and climb
+};
+const attitude = { bank: 0, nose: 0 };
+
+// Hand over from flying to the mouse: as soon as an orbit, pan or zoom starts, stop the flight, level the view
+// and move the orbit point to where the line of sight passes closest to the centre of the data. After flying,
+// the orbit point would otherwise still be at the old distance, often far beyond the data, and the camera
+// would swing around it in big arcs while still drifting.
+const handoverTmp = { dir: new THREE.Vector3(), center: new THREE.Vector3() };
+controls.addEventListener('start', () => {
+  const wasFlying = Object.values(flight).some((v) => v !== 0) || attitude.bank !== 0 || attitude.nose !== 0;
+  stopFlight();
+  attitude.bank = attitude.nose = 0;
+  if (!wasFlying || !state.geo) return;
+  const { px, py, zmin, zmax, ext } = state.geo;
+  const s = vscale();
+  const { dir, center } = handoverTmp;
+  dir.subVectors(controls.target, camera.position).normalize();
+  center.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, ((zmin + zmax) / 2) * s);
+  // Distance along the view to the point closest to the data centre; a fixed distance when the data is behind
+  const along = center.sub(camera.position).dot(dir);
+  const distance = along > ext * 0.02 ? along : ext * 0.3;
+  controls.target.copy(camera.position).addScaledVector(dir, distance);
+});
+
+function applyAttitude(dt) {
+  const max = state.geo ? state.geo.ext * FLY.maxSpeed : 1;
+  // More bank at speed, but some while turning on the spot too, so the turn is felt
+  const speedFactor = 0.4 + 0.6 * Math.min(1, Math.abs(flight.forward) / max);
+  const bank = THREE.MathUtils.clamp((flight.yaw / FLY.maxTurn) * ATTITUDE.maxBank * speedFactor, -ATTITUDE.maxBank, ATTITUDE.maxBank);
+  const climb = THREE.MathUtils.clamp(flight.vertical / max, -1, 1) * ATTITUDE.maxNose;
+  const nose = THREE.MathUtils.clamp(climb + Math.abs(bank) * ATTITUDE.turnNose, -ATTITUDE.maxNose, ATTITUDE.maxNose);
+  const f = 1 - Math.exp(-ATTITUDE.response * dt);
+  attitude.bank += (bank - attitude.bank) * f;
+  attitude.nose += (nose - attitude.nose) * f;
+  if (Math.abs(attitude.bank) < 1e-5 && Math.abs(attitude.nose) < 1e-5) return;
+  // After OrbitControls aimed the camera at the target this frame: roll about the view axis, then pitch the nose
+  camera.rotateZ(attitude.bank); // positive: left wing down, for a left turn
+  camera.rotateX(attitude.nose);
+  camera.updateMatrixWorld();
+}
+const isTyping = (el) => el && (el.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName));
+window.addEventListener('keydown', (e) => {
+  if (!FLY_CODES.has(e.code) || isTyping(document.activeElement) || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.code === 'Space') {
+    // Space stops the flight; it must not also press a focused button such as play
+    if (document.activeElement?.tagName === 'BUTTON') document.activeElement.blur();
+    stopFlight();
+  } else {
+    flyKeys.add(e.code);
+  }
+  e.preventDefault(); // arrow keys and space would scroll the panel
+});
+window.addEventListener('keyup', (e) => flyKeys.delete(e.code));
+window.addEventListener('blur', () => flyKeys.clear());
+// Clicking the view takes the focus from panel fields, so the flight keys work right away
+canvas.addEventListener('pointerdown', () => { if (isTyping(document.activeElement)) document.activeElement.blur(); });
+
+// Moves value towards a target speed with acceleration a, or lets it fade with drag when there is no input
+function steer(value, input, max, a, drag, dt) {
+  if (input) return THREE.MathUtils.clamp(value + input * a * dt, -max, max);
+  return value * Math.exp(-drag * dt);
+}
+
+function fly(dt) {
+  if (!state.geo) return;
+  const k = (code) => (flyKeys.has(code) ? 1 : 0);
+  const moving = Object.values(flight).some((v) => Math.abs(v) > 1e-9);
+  if (!moving && !flyKeys.size) return;
+
+  const boost = k('ShiftLeft') || k('ShiftRight') ? 2 : 1;
+  const ext = state.geo.ext, max = ext * FLY.maxSpeed * boost, a = ext * FLY.accel * boost;
+  const forwardInput = k('KeyW') - k('KeyS');
+  // Speed up or slow down along the nose; without input the speed is kept
+  flight.forward = forwardInput
+    ? THREE.MathUtils.clamp(flight.forward + forwardInput * a * dt, -max, max)
+    : flight.forward * Math.exp(-FLY.forwardDrag * dt);
+  flight.side = steer(flight.side, k('KeyD') - k('KeyA'), max, a, FLY.driftDrag, dt);
+  flight.vertical = steer(flight.vertical, k('KeyE') - k('KeyQ'), max, a, FLY.driftDrag, dt);
+  flight.yaw = steer(flight.yaw, k('ArrowLeft') - k('ArrowRight'), FLY.maxTurn, FLY.turnAccel, FLY.turnDrag, dt);
+  flight.pitch = steer(flight.pitch, k('ArrowUp') - k('ArrowDown'), FLY.maxTurn, FLY.turnAccel, FLY.turnDrag, dt);
+  for (const key of Object.keys(flight)) if (Math.abs(flight[key]) < (key === 'yaw' || key === 'pitch' ? 1e-4 : ext * 1e-5)) flight[key] = 0;
+
+  const { dir, right, move, up } = flyTmp;
+  const offset = move.subVectors(controls.target, camera.position); // camera → target, kept while flying
+  let distance = offset.length();
+  if (distance < 1e-6) distance = ext * 0.1;
+  dir.copy(offset).normalize();
+
+  // Turn about the vertical axis, pitch about the camera's right axis (not past straight up/down)
+  if (flight.yaw) dir.applyAxisAngle(up, flight.yaw * dt);
+  right.crossVectors(dir, up);
+  if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
+  right.normalize();
+  if (flight.pitch) {
+    const pitched = dir.clone().applyAxisAngle(right, flight.pitch * dt);
+    if (Math.abs(pitched.z) < 0.995) dir.copy(pitched);
+    else flight.pitch = 0;
+  }
+
+  // The forward motion follows the nose, so the path curves with a turn
+  move.set(0, 0, 0)
+    .addScaledVector(dir, flight.forward)
+    .addScaledVector(right, flight.side)
+    .addScaledVector(up, flight.vertical);
+  camera.position.addScaledVector(move, dt);
+  controls.target.copy(camera.position).addScaledVector(dir, distance);
+}
+
+// Position, height, speed and heading while flying, at the bottom right of the view
+let flightInfoAt = 0, flightIdleSince = 0;
+function updateFlightInfo(now) {
+  const el = $('flightInfo');
+  const moving = Object.values(flight).some((v) => v !== 0);
+  if (moving) flightIdleSince = 0;
+  else if (!flightIdleSince) flightIdleSince = now;
+  const show = !!state.geo && (moving || now - flightIdleSince < 1500);
+  el.classList.toggle('visible', show);
+  if (!show || now - flightInfoAt < 100) return; // about ten updates a second is plenty
+  flightInfoAt = now;
+  const g = state.grid, { lon0, lat0, kx, ky, levelSpacing } = state.geo;
+  const p = camera.position;
+  const x = lon0 + p.x / kx, y = lat0 + p.y / ky; // grid coordinates: lon/lat, or rotated on a native grid
+  const [lon, lat] = g.proj ? g.proj.toGeo(x, y) : [x, y];
+  const z = p.z / vscale();
+  let height;
+  if (g.vkind === 'pressure' || g.vkind === 'height' || (g.vmode === 'pressure' && g.data[g.pressureParam])) height = `${fmt(z / KM_SCALE, 2)} km`;
+  else {
+    // Level index from the height; levels are evenly spaced in the scene, extrapolated above and below the box
+    const f = (g.nz - 1) - z / Math.max(levelSpacing, 1e-9);
+    const step = g.nz > 1 ? g.levels[1] - g.levels[0] : 1;
+    const level = g.levels[0] + f * step;
+    height = level < g.levels[0] ? `above level ${g.levels[0]}` : level > g.levels.at(-1) ? `below level ${g.levels.at(-1)}` : `level ${fmt(level, 1)}`;
+  }
+  const dir = flyTmp.move.subVectors(controls.target, p).normalize();
+  const heading = (THREE.MathUtils.radToDeg(Math.atan2(dir.x, dir.y)) + 360) % 360;
+  const speed = Math.hypot(flight.forward, flight.side, flight.vertical); // scene units are km horizontally
+  el.innerHTML = `${fmt(Math.abs(lat), 3)}°${lat >= 0 ? 'N' : 'S'} ${fmt(Math.abs(lon), 3)}°${lon >= 0 ? 'E' : 'W'} · ${height}<br>` +
+    `speed <b>${fmt(speed, speed < 10 ? 2 : 1)} km/s</b> · heading ${fmt(heading, 0)}°${g.proj ? ' (grid)' : ''}`;
+}
+
+// Drawing only when something changes, so an idle view costs (almost) nothing. Things that change the scene
+// call requestRender; camera motion, flying, banking and streamlines keep drawing while they are active.
+function requestRender(frames = 2) {
+  renderFrames = Math.max(renderFrames, frames);
+}
+// Any input in the page can change what is shown (sliders, checkboxes, menus, keys)
+for (const type of ['input', 'change', 'click', 'keydown', 'keyup']) document.addEventListener(type, () => requestRender(), true);
+controls.addEventListener('change', () => requestRender());
+
+renderer.setAnimationLoop((now) => {
+  const dt = Math.min(flyClock.getDelta(), 0.1); // capped, so a stalled frame does not jump far
+  fly(dt);
+  const cameraMoved = controls.update();
+  applyAttitude(dt);
+  updateFlightInfo(now);
+  streamlines.update(dt);
+  const flying = flyKeys.size > 0 || Object.values(flight).some((v) => v !== 0);
+  const banking = Math.abs(attitude.bank) > 1e-5 || Math.abs(attitude.nose) > 1e-5;
+  if (!(cameraMoved || flying || banking || streamlines.object.visible || pickPending || renderFrames > 0)) return;
+  if (renderFrames > 0) renderFrames--;
+  if (skyGroup.visible) {
+    skyGroup.position.copy(camera.position); // centred on the camera: infinitely far away
+    skyGroup.scale.setScalar(camera.far * 0.9); // inside the far plane
+  }
   updateHaze();
   if (state.volume && volumeGroup.visible) updateVolumeCamera(state.volume.mesh, camera);
   if (pickPending) {
@@ -209,7 +518,7 @@ const vscale = () => 10 ** Number($('vscale').value);
 function paramUnit(id) {
   const u = state.collection?.parameter_names?.[id]?.unit?.symbol;
   const s = typeof u === 'string' ? u : u?.value;
-  return s === 'C' ? '°C' : s && s !== 'unknown' ? s : '';
+  return s === 'C' ? '°C' : s && s !== 'unknown' && s !== '-^-' ? s : '';
 }
 
 // Pressure (hPa) → ISA altitude (km), tropospheric + isothermal stratospheric layer.
@@ -240,11 +549,12 @@ function sampleField(field, fi, fj, fk) {
 }
 
 function disposeChildren(group) {
+  requestRender(); // every rebuild of scene content starts here
   for (const o of [...group.children]) {
     group.remove(o);
     o.geometry?.dispose();
     if (o.material && o.material !== sliceMaterial) {
-      if (o.material.map !== state.mapTex?.tex) o.material.map?.dispose();
+      if (!Object.values(state.mapTex).some((entry) => entry.tex === o.material.map)) o.material.map?.dispose();
       o.material.dispose();
     }
   }
@@ -253,24 +563,59 @@ function disposeChildren(group) {
 // ---------------------------------------------------------------- metadata
 
 async function loadCollection(collectionUrl, prefer = {}) {
+  stopAnimation(); // its list of times belongs to the old collection
   setStatus('Loading collection metadata…');
-  const url = collectionUrl.replace(/\/+$/, '');
+  const url = collectionUrl.trim().replace(/\/+$/, '');
   state.collection = await fetchJSON(url);
+  state.collectionUrl = url;
   const sel = $('parameter');
   sel.innerHTML = '';
   for (const [id, p] of Object.entries(state.collection.parameter_names || {})) {
     const unit = paramUnit(id);
     sel.append(option(id, `${p.label || id}${unit ? ` [${unit}]` : ''}`));
   }
-  if (prefer.parameter && state.collection.parameter_names?.[prefer.parameter]) sel.value = prefer.parameter;
+  const wind = windPairOf(state.collection);
+  if (wind) {
+    const unit = paramUnit(wind.speed);
+    sel.append(option(WIND_OPTION, `Wind: speed + direction, with streamlines${unit ? ` [${unit}]` : ''}`));
+  }
+  if (prefer.parameter) {
+    // Servers spell the same parameter as wind_speed_ml or wind-speed-ml
+    const norm = (id) => id.toLowerCase().replace(/[-_]/g, '');
+    const match = Object.keys(state.collection.parameter_names || {}).find((id) => norm(id) === norm(prefer.parameter));
+    if (match) sel.value = match;
+  }
 
-  const vals = (state.collection.extent?.vertical?.values || []).map(Number).filter(Number.isFinite);
+  state.native = nativeCubeCrs(state.collection);
+  const csel = $('gridCrs');
+  csel.innerHTML = '';
+  csel.append(option('', 'EPSG:4326 (resampled to lon/lat)'));
+  if (state.native) {
+    const { crs, proj } = state.native;
+    csel.append(option(crs, `${crs}: rotated pole (lon_0 ${proj.lon0}, o_lat_p ${proj.oLatP}), no resampling`));
+  }
+  // Native grid by default when offered; an explicit EPSG:4326 / CRS84 (or '') keeps lon/lat.
+  csel.value = state.native && (prefer.crs == null || prefer.crs === state.native.crs) ? state.native.crs : '';
+  csel.disabled = !state.native;
+  syncViewControls();
+
+  const previousKind = state.vertical?.kind, previousValues = state.vertical?.values.join();
+  state.vertical = verticalOf(state.collection);
+  const vals = state.vertical.values;
   if (vals.length) {
     for (const id of ['levelFrom', 'levelTo']) {
       $(id).min = Math.min(...vals);
       $(id).max = Math.max(...vals);
     }
+    // Another set of levels (e.g. pressure instead of model levels): select all of them
+    if (previousKind !== state.vertical.kind || previousValues !== vals.join()) {
+      $('levelFrom').value = Math.min(...vals);
+      $('levelTo').value = Math.max(...vals);
+    }
   }
+  // Pressure-altitude placement is for model levels; pressure and height levels are placed by their value
+  $('vmode').disabled = state.vertical.kind !== 'level';
+  $('vmode').title = state.vertical.kind !== 'level' ? `The ${state.vertical.label} are placed at their height` : '';
 
   const isel = $('instance');
   isel.innerHTML = '';
@@ -284,17 +629,61 @@ async function loadCollection(collectionUrl, prefer = {}) {
   if (prefer.instance && isel.value !== prefer.instance) {
     setStatus(`Instance ${prefer.instance} not available, using ${isel.value || 'collection'}`);
   }
-  updateDatetimes(prefer.datetime);
+  showCollectionNeighbours(url); // in the background
+  instanceDocs.clear(); // a reloaded collection can have new or longer runs
+  await updateDatetimes(prefer.datetime);
 }
 
+// Instance documents by URL. The /instances list of the KNMI server gives every run the same times, so the
+// times come from the document of the instance itself (…/instances/{id}), which has the right ones.
+const instanceDocs = new Map();
+
+async function instanceTimes(instanceId) {
+  const listed = state.instances.find((i) => i.id === instanceId);
+  if (!listed) return parseTemporalValues(state.collection?.extent?.temporal?.values || []);
+  const url = `${state.collectionUrl}/instances/${encodeURIComponent(instanceId)}`;
+  if (!instanceDocs.has(url)) {
+    try {
+      instanceDocs.set(url, await fetchJSON(url, { retries: 0 }));
+    } catch (e) {
+      console.warn('Could not read instance document, using the instance list', e);
+      instanceDocs.set(url, listed);
+    }
+  }
+  const doc = instanceDocs.get(url);
+  const times = parseTemporalValues((doc?.extent?.temporal?.values ? doc : listed)?.extent?.temporal?.values || []);
+  // A run does not forecast its own past. The KNMI server sometimes gives a run (e.g. the newest, while it is
+  // being published) the times of the whole collection, starting days before the run: drop those, if any remain.
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(instanceId);
+  if (!m) return times;
+  const runTime = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+  const ahead = times.filter((t) => Date.parse(t) > runTime);
+  return ahead.length ? ahead : times;
+}
+
+// Fills the time list for the selected instance. Loads wait for state.timesReady, so they never combine a run
+// with a time of the previous run while its times are still being read.
 function updateDatetimes(prefer) {
-  const inst = state.instances.find((i) => i.id === $('instance').value);
-  const times = parseTemporalValues((inst || state.collection)?.extent?.temporal?.values || []);
   const sel = $('datetime');
-  const current = prefer ? toIso(Date.parse(prefer)) : sel.value;
+  const keep = prefer ? toIso(Date.parse(prefer)) : sel.value;
+  if (!instanceDocs.has(`${state.collectionUrl}/instances/${encodeURIComponent($('instance').value)}`) && state.instances.length) {
+    sel.innerHTML = '';
+    sel.append(option('', 'loading times…'));
+    syncViewControls();
+  }
+  state.timesReady = fillDatetimes(keep);
+  return state.timesReady;
+}
+
+async function fillDatetimes(current) {
+  const instanceId = $('instance').value;
+  const times = await instanceTimes(instanceId);
+  if ($('instance').value !== instanceId) return; // another instance was chosen meanwhile
+  const sel = $('datetime');
   sel.innerHTML = '';
   for (const t of times) sel.append(option(t, t.replace('T', ' ').replace(':00Z', 'Z')));
   if (times.includes(current)) sel.value = current;
+  syncViewControls();
 }
 
 // ---------------------------------------------------------------- loading
@@ -305,30 +694,125 @@ function readBBox() {
   return b;
 }
 
-async function loadData() {
+// What the scene geometry depends on, apart from the values: when this is unchanged the camera can stay
+const viewKey = (g) => [g.lons[0], g.lons.at(-1), g.lats[0], g.lats.at(-1), g.nx, g.ny, g.levels[0], g.levels.at(-1), g.vmode, g.crs].join();
+
+// The cube request for the panel settings, optionally for another time. Throws on invalid input.
+function buildRequest(datetime = $('datetime').value) {
+  const selection = $('parameter').value;
+  // Derived wind: speed is the field shown, the direction comes along for the streamlines
+  const wind = selection === WIND_OPTION ? windPairOf(state.collection) : null;
+  if (selection === WIND_OPTION && !wind) throw new Error('This collection has no wind speed and direction');
+  const param = wind ? wind.speed : selection;
+  const vmode = $('vmode').value;
+  const pressureParam = pressureParamOf(state.collection);
+  const pressureMode = vmode === 'pressure' && (state.vertical?.kind ?? 'level') === 'level';
+  const params = [param, ...(wind ? [wind.dir] : []), ...(pressureMode && param !== pressureParam ? [pressureParam] : [])];
+  const crs = $('gridCrs').value;
+  const proj = crs && state.native?.crs === crs ? state.native.proj : null;
+  const levelFrom = Number($('levelFrom').value), levelTo = Number($('levelTo').value);
+  if (!(levelFrom <= levelTo)) throw new Error('Level from must be ≤ level to');
+  // The collection's level values within the range (top first), every n-th with a vertical step
+  const vertical = state.vertical?.values.length ? state.vertical : { kind: 'level', values: [] };
+  const levelStep = Number($('levelStep').value) || 1;
+  const inRange = vertical.values.length
+    ? vertical.values.filter((v) => v >= levelFrom && v <= levelTo)
+    : Array.from({ length: Math.round(levelTo) - Math.round(levelFrom) + 1 }, (_, n) => Math.round(levelFrom) + n);
+  const levels = inRange.filter((_, n) => n % levelStep === 0);
+  if (!levels.length) throw new Error(`No ${vertical.label || 'levels'} between ${levelFrom} and ${levelTo}`);
+  const opts = {
+    collectionUrl: state.collectionUrl || $('collectionUrl').value.trim(),
+    instance: $('instance').value,
+    datetime,
+    // The panel bbox is lon/lat; with a native crs the request bbox must be in native (rotated) coordinates
+    bbox: proj ? bboxToRot(proj, readBBox()) : readBBox(),
+    crs: crs || undefined,
+    levelFrom, levelTo, params, levels, levelStep,
+    allLevels: vertical.values.length ? vertical.values : inRange,
+    levelsPerRequest: Number($('levelsPerRequest').value) || 5,
+    stride: $('stride').value === 'auto' ? 'auto' : Number($('stride').value),
+    fixScale: $('fixScale').value,
+    concurrency: Number($('concurrency').value) || 6,
+    angleParams: wind ? [wind.dir] : [], // averaged as unit vectors with a horizontal step
+  };
+  const vkind = vertical.kind, vmodeUsed = vkind === 'level' ? vmode : 'level';
+  const meta = { param, selection, wind, vmode: vmodeUsed, vkind, pressureParam, crs, proj, unit: paramUnit(param), datetime, instance: opts.instance };
+  return { opts, meta, key: JSON.stringify([opts.collectionUrl, opts.instance, datetime, opts.bbox, opts.crs, levels, params, opts.stride, opts.fixScale, vmodeUsed]) };
+}
+
+// Loaded cubes, so animating or stepping back to a time does not load it again. Oldest used are dropped first.
+const FRAME_CACHE_BYTES = 1024 * 1024 * 1024;
+const frameCache = new Map(); // key → grid, in order of use
+const framesLoading = new Map(); // key → promise of grid
+let frameCacheBytes = 0;
+const gridBytes = (g) => Object.values(g.data).reduce((sum, a) => sum + a.byteLength, 0);
+
+function cachedFrame(key) {
+  const grid = frameCache.get(key);
+  if (grid) { frameCache.delete(key); frameCache.set(key, grid); }
+  return grid;
+}
+
+function cacheFrame(key, grid) {
+  if (frameCache.has(key)) frameCacheBytes -= gridBytes(frameCache.get(key));
+  frameCache.delete(key);
+  frameCache.set(key, grid);
+  frameCacheBytes += gridBytes(grid);
+  for (const [k, g] of frameCache) {
+    if (frameCacheBytes <= FRAME_CACHE_BYTES || frameCache.size <= 2) break;
+    if (g === state.grid) continue;
+    frameCache.delete(k);
+    frameCacheBytes -= gridBytes(g);
+  }
+}
+
+// The grid for a request: from the cache, from a load already running, or loaded now
+function fetchFrame({ opts, meta, key }, { signal, onProgress, onUrl, force = false } = {}) {
+  if (!force) {
+    const grid = cachedFrame(key);
+    if (grid) return Promise.resolve(Object.assign(grid, meta)); // the vertical coordinate switch can have changed it
+    if (framesLoading.has(key)) return framesLoading.get(key);
+  }
+  const promise = loadCube(opts, { signal, onProgress, onUrl })
+    .then((grid) => {
+      Object.assign(grid, meta);
+      cacheFrame(key, grid);
+      return grid;
+    })
+    .finally(() => { if (framesLoading.get(key) === promise) framesLoading.delete(key); });
+  framesLoading.set(key, promise);
+  return promise;
+}
+
+function showGrid(grid) {
+  requestRender();
+  // Keep the camera when only the time or parameter changed; fit it again for a new area, grid or levels
+  const refit = !state.grid || viewKey(state.grid) !== viewKey(grid);
+  state.grid = grid;
+  rebuildAll();
+  if (refit) fitCamera();
+}
+
+// force: load again from the server, also when the cube is in the cache (the Load button)
+async function loadData({ force = false } = {}) {
+  stopAnimation();
+  await state.timesReady;
   state.abort?.abort();
   const ac = new AbortController();
   state.abort = ac;
-  const param = $('parameter').value;
-  const vmode = $('vmode').value;
-  const params = vmode === 'pressure' && param !== PRESSURE_PARAM ? [param, PRESSURE_PARAM] : [param];
-  let opts;
+  let request;
   try {
-    const levelFrom = Math.round(Number($('levelFrom').value)), levelTo = Math.round(Number($('levelTo').value));
-    if (!(levelFrom <= levelTo)) throw new Error('Level from must be ≤ level to');
-    opts = {
-      collectionUrl: $('collectionUrl').value.trim(),
-      instance: $('instance').value,
-      datetime: $('datetime').value,
-      bbox: readBBox(),
-      levelFrom, levelTo, params,
-      levelsPerRequest: Number($('levelsPerRequest').value) || 5,
-      stride: $('stride').value === 'auto' ? 'auto' : Number($('stride').value),
-      fixScale: $('fixScale').value,
-      concurrency: Number($('concurrency').value) || 6,
-    };
+    request = buildRequest();
   } catch (e) {
     setStatus(e.message, true);
+    return;
+  }
+  const { opts } = request;
+  const cached = !force && cachedFrame(request.key);
+  if (cached) {
+    showGrid(Object.assign(cached, request.meta));
+    setStatus(`Shown from memory: ${cached.nx}×${cached.ny}×${cached.nz} points at ${opts.datetime}`);
+    if (state.abort === ac) state.abort = null;
     return;
   }
 
@@ -338,20 +822,19 @@ async function loadData() {
   const loader = startLoader();
   const t0 = performance.now();
   try {
-    const grid = await loadCube(opts, {
+    const grid = await fetchFrame(request, {
       signal: ac.signal,
+      force,
       onUrl: (u) => { $('requestUrl').href = u; $('requestUrl').textContent = u; },
       onProgress: loader.update,
     });
-    Object.assign(grid, { param, vmode, unit: paramUnit(param), datetime: opts.datetime, instance: opts.instance });
     loader.update({ phase: 'building' });
     await new Promise((res) => requestAnimationFrame(() => setTimeout(res)));
-    state.grid = grid;
-    rebuildAll();
-    fitCamera();
+    if (state.abort !== ac) return; // another load or the animation took over
+    showGrid(grid);
     const s = ((performance.now() - t0) / 1000).toFixed(1);
     const step = grid.stride > 1 ? ` (${grid.sourceSize.join('×')} averaged ${grid.stride}×${grid.stride})` : '';
-    setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${step} with ${grid.requests} request${grid.requests > 1 ? 's' : ''} in ${s} s` +
+    setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${grid.proj ? ' on the native grid' : ''}${step} with ${grid.requests} request${grid.requests > 1 ? 's' : ''} in ${s} s` +
       (grid.scaleFixed ? ` (×10 server fix applied to ${grid.scaleFixed} response${grid.scaleFixed > 1 ? 's' : ''})` : ''));
   } catch (e) {
     if (e.name === 'AbortError') setStatus('Cancelled');
@@ -366,6 +849,71 @@ async function loadData() {
     if (state.abort === ac) state.abort = null;
   }
 }
+
+// ---------------------------------------------------------------- animation over time
+// Steps through the times of the instance, wrapping around. The next time is loaded while the current one is
+// shown, and every loaded time stays in the frame cache, so the second loop plays from memory.
+
+const anim = { playing: false, abort: null };
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+function updatePlayButton() {
+  $('vcPlay').textContent = anim.playing ? '⏸' : '▶';
+  $('vcPlay').title = anim.playing ? 'Pause the animation' : 'Animate over time';
+  $('vcPlay').classList.toggle('active', anim.playing);
+}
+
+function stopAnimation() {
+  if (!anim.playing) return;
+  anim.playing = false;
+  anim.abort?.abort();
+  anim.abort = null;
+  updatePlayButton();
+  $('vcAnimInfo').textContent = '';
+  setStatus('Animation paused');
+}
+
+async function startAnimation() {
+  const times = [...$('datetime').options].map((o) => o.value);
+  if (times.length < 2) {
+    setStatus('Only one time: nothing to animate', true);
+    return;
+  }
+  state.abort?.abort(); // a load from the panel is replaced by the animation
+  anim.playing = true;
+  anim.abort = new AbortController();
+  const { signal } = anim.abort;
+  updatePlayButton();
+  let index = Math.max(0, times.indexOf(state.grid?.datetime ?? $('datetime').value));
+  try {
+    while (anim.playing) {
+      const next = (index + 1) % times.length;
+      const t0 = performance.now();
+      const request = buildRequest(times[next]);
+      if (!cachedFrame(request.key)) $('vcAnimInfo').textContent = 'loading…';
+      const grid = await fetchFrame(request, { signal });
+      // Load the time after this one while this one is shown
+      fetchFrame(buildRequest(times[(next + 1) % times.length]), { signal }).catch(() => {});
+      await sleep(Number($('vcSpeed').value) - (performance.now() - t0));
+      if (!anim.playing) break;
+      $('datetime').value = times[next];
+      showGrid(grid);
+      $('vcAnimInfo').textContent = `${next + 1}/${times.length}`;
+      setStatus(`Animating: ${times[next]} (${next + 1} of ${times.length}), ${frameCache.size} times in memory (${fmtBytes(frameCacheBytes)})`);
+      index = next;
+      await new Promise((res) => requestAnimationFrame(res)); // let the frame be drawn
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      console.error(e);
+      stopAnimation();
+      setStatus(e.message, true);
+    }
+  }
+}
+
+// 1234 → 1234, 45678 → 45.7 k, 1234567 → 1.23 M
+const fmtCount = (n) => (n >= 1e6 ? `${(n / 1e6).toPrecision(3)} M` : n >= 1e4 ? `${(n / 1e3).toPrecision(3)} k` : `${n ?? 0}`);
 
 const fmtBytes = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.round(b / 1024)} KB`);
 
@@ -427,6 +975,8 @@ async function applyUrl() {
       $('levelTo').value = p.levels[1];
     }
     await loadCollection(p.collectionUrl, p);
+    // A native cube URL has its bbox in rotated coordinates; the panel shows lon/lat
+    if (p.bbox?.length === 4 && p.crs && state.native?.crs === p.crs) setBBox(bboxToGeo(state.native.proj, p.bbox));
     await loadData();
   } catch (e) {
     console.error(e);
@@ -446,8 +996,14 @@ function computeGeo() {
   const ext = Math.max(px[nx - 1] - px[0], py[ny - 1] - py[0]);
   const pz = new Float32Array(nx * ny * nz);
   let levelSpacing = 0;
-  if (g.vmode === 'pressure' && g.data[PRESSURE_PARAM]) {
-    const p = g.data[PRESSURE_PARAM];
+  if (g.vkind === 'pressure' || g.vkind === 'height') {
+    // Pressure levels at their ISA height, heights above ground at their height
+    for (let k = 0; k < nz; k++) {
+      const km = g.vkind === 'pressure' ? isaAltitudeKm(g.levels[k]) : g.levels[k] / 1000;
+      pz.fill(km * KM_SCALE, k * nx * ny, (k + 1) * nx * ny);
+    }
+  } else if (g.vmode === 'pressure' && g.data[g.pressureParam]) {
+    const p = g.data[g.pressureParam];
     for (let n = 0; n < pz.length; n++) pz[n] = p[n] > 0 ? isaAltitudeKm(p[n]) * KM_SCALE : NaN;
     // Fill missing pressures with the level mean so geometry stays intact.
     const layer = nx * ny;
@@ -487,11 +1043,14 @@ function rebuildAll() {
   setupSliceSliders();
   updateColormap();
   buildBox();
+  buildGridCells();
   buildBorders();
   buildGround();
+  buildEarth();
   buildSlices();
   for (const iso of state.isos) buildIso(iso);
   buildVolume();
+  buildStreamlines();
   applyRenderMode();
   applyVScale();
   updateHud();
@@ -512,7 +1071,9 @@ function buildVolume() {
   const g = state.grid;
   if (!g || g.nz < 2 || $('renderMode').value === 'iso') return;
   const { px, py, pz, zmin, zmax } = state.geo;
-  const vol = resampleVolume(g.data[g.param], g.nx, g.ny, g.nz, pz, zmin, zmax, g.vmode !== 'pressure' || !g.data[PRESSURE_PARAM]);
+  // Evenly spaced model levels go into the texture as they are; anything placed at real heights is resampled
+  const placedByHeight = g.vkind === 'pressure' || g.vkind === 'height' || (g.vmode === 'pressure' && !!g.data[g.pressureParam]);
+  const vol = resampleVolume(g.data[g.param], g.nx, g.ny, g.nz, pz, zmin, zmax, !placedByHeight);
   const tex = createVolumeTexture(vol, g.nx, g.ny);
   volumeUniforms.vol.value = tex;
   volumeUniforms.texSize.value.set(g.nx, g.ny, vol.depth);
@@ -531,6 +1092,7 @@ function applyRenderMode() {
   volumeGroup.visible = mode !== 'iso';
   $('volumeOpts').hidden = mode === 'iso';
   if (volumeGroup.visible && !state.volume) buildVolume();
+  if (isoGroup.visible) for (const iso of state.isos) if (iso.dirty) buildIso(iso);
 }
 
 function updateVolumeSettings() {
@@ -569,6 +1131,93 @@ function updateVolumeColors() {
   $('volCbarUnit').textContent = state.grid?.unit || '';
 }
 
+// Streamlines for the derived wind: the wind vector per grid point from speed and direction (where the wind
+// comes from, degrees clockwise from true north), turned to the scene. On a rotated pole grid north differs per
+// point, so the angle between true north and grid north is taken at every column. Particles start where the
+// volume is drawn: in 'fill above' only above the threshold, so they trace e.g. the jet stream.
+const STREAM_CROSS_TIME = 12; // seconds for the fastest wind to cross the area
+let streamWind = null; // { grid, u, v } of the last computed wind, reused when only the threshold changes
+
+function buildStreamlines() {
+  const g = state.grid;
+  streamlines.object.visible = !!g?.wind && $('vcStream').checked;
+  if (!g?.wind || !streamlines.object.visible) return;
+  const { nx, ny, nz, lons, lats, proj } = g;
+  const { px, py, pz, kx, ky } = state.geo;
+  if (streamWind?.grid !== g) {
+    const speed = g.data[g.wind.speed], dir = g.data[g.wind.dir];
+    // Angle of true north in the scene per column (0 on a lon/lat grid, where north is +y everywhere)
+    const north = new Float32Array(nx * ny);
+    if (proj) {
+      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+        const [lon, lat] = proj.toGeo(lons[i], lats[j]);
+        const [x2, y2] = proj.toRot(lon, Math.min(89.9, lat + 0.05));
+        north[j * nx + i] = Math.atan2((x2 - lons[i]) * kx, (y2 - lats[j]) * ky);
+      }
+    }
+    const u = new Float32Array(nx * ny * nz), v = new Float32Array(nx * ny * nz);
+    for (let n = 0; n < u.length; n++) {
+      const s = speed[n], d = dir[n] * DEG;
+      if (s !== s || d !== d) { u[n] = v[n] = NaN; continue; }
+      const east = -s * Math.sin(d), northward = -s * Math.cos(d); // towards which the wind blows
+      const a = north[n % (nx * ny)], ca = Math.cos(a), sa = Math.sin(a);
+      u[n] = east * ca + northward * sa;
+      v[n] = -east * sa + northward * ca;
+    }
+    streamWind = { grid: g, u, v };
+  }
+  const speed = g.data[g.param];
+  const vis = state.isos.filter((iso) => iso.visible);
+  const t = vis[0]?.value, style = Number($('volStyle').value), width = Number($('volWidth').value);
+  const volumeShown = $('renderMode').value !== 'iso' && t != null;
+  const seedable = (n) => {
+    const s = speed[n];
+    if (s !== s) return false;
+    if (!volumeShown) return true;
+    if (style === 0) return s >= t;
+    if (style === 1) return s <= t;
+    return vis.slice(0, MAX_ISO_LINES).some((iso) => Math.abs(s - iso.value) <= 1.5 * width);
+  };
+  streamlines.setField({ nx, ny, nz, u: streamWind.u, v: streamWind.v, speed, px, py, pz, seedable, crossTime: STREAM_CROSS_TIME });
+}
+const DEG = Math.PI / 180;
+
+// The grid cells in use (after averaging, on the native grid when loaded so): cell edges on the ground, and on
+// the west and north walls a line per column and per loaded level. In pressure-altitude mode the level lines
+// follow the actual heights along the wall.
+function buildGridCells() {
+  disposeChildren(gridGroup);
+  gridGroup.visible = $('gridOn').checked;
+  if (!state.grid || !gridGroup.visible) return;
+  const { nx, ny, nz } = state.grid;
+  const { px, py, pz, zmin, zmax, ext } = state.geo;
+  // Cell edges halfway between the centres; the outer cells end at the box, which runs from centre to centre
+  const edges = (c) => [c[0], ...Array.from({ length: c.length - 1 }, (_, n) => (c[n] + c[n + 1]) / 2), c.at(-1)];
+  const ex = edges(px), ey = edges(py);
+  const x0 = px[0], x1 = px.at(-1), y0 = py[0], y1 = py.at(-1);
+  const zg = zmin - ext * 0.0022; // just above the base map, below the borders
+  const pts = [];
+  for (const x of ex) pts.push(x, y0, zg, x, y1, zg);
+  for (const y of ey) pts.push(x0, y, zg, x1, y, zg);
+  // Walls: west (x = x0) and north (y = y1), where the level labels are
+  for (const x of ex) pts.push(x, y1, zmin, x, y1, zmax);
+  for (const y of ey) pts.push(x0, y, zmin, x0, y, zmax);
+  for (let k = 0; k < nz; k++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const a = (k * ny + ny - 1) * nx + i;
+      pts.push(px[i], y1, pz[a], px[i + 1], y1, pz[a + 1]);
+    }
+    for (let j = 0; j < ny - 1; j++) {
+      const a = (k * ny + j) * nx;
+      pts.push(x0, py[j], pz[a], x0, py[j + 1], pz[a + nx]);
+    }
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  const mat = new THREE.LineBasicMaterial({ color: 0x9fb4c8, transparent: true, opacity: 0.18, depthWrite: false });
+  gridGroup.add(new THREE.LineSegments(geom, mat));
+}
+
 function buildBox() {
   disposeChildren(boxGroup);
   const { px, py, zmin, zmax } = state.geo;
@@ -594,17 +1243,28 @@ function clipSegment(ax, ay, bx, by, r) {
   return [ax + t0 * dx, ay + t0 * dy, ax + t1 * dx, ay + t1 * dy];
 }
 
+// Border lines in the grid's x/y: lon/lat, or rotated lon/lat for a native rotated pole grid (cached).
+let bordersInGrid = { proj: null, lines: null };
+function gridBorders(proj) {
+  if (!proj) return state.borders;
+  if (bordersInGrid.proj !== proj || bordersInGrid.src !== state.borders) {
+    bordersInGrid = { proj, src: state.borders, lines: state.borders.map((line) => line.map(([lon, lat]) => proj.toRot(lon, lat))) };
+  }
+  return bordersInGrid.lines;
+}
+
 function buildBorders() {
   disposeChildren(mapGroup);
   if (!state.grid) return;
-  const { lons, lats } = state.grid;
+  const { lons, lats, proj } = state.grid;
   const { lon0, lat0, kx, ky, zmin, px, py, ext } = state.geo;
   const z = zmin - ext * 0.002;
   if (state.borders) {
     const rect = [lons[0], lats[0], lons.at(-1), lats.at(-1)];
     const pts = [];
-    for (const line of state.borders) {
+    for (const line of gridBorders(proj)) {
       for (let n = 1; n < line.length; n++) {
+        if (Math.abs(line[n][0] - line[n - 1][0]) > 180) continue; // wraps around the (rotated) date line
         const s = clipSegment(line[n - 1][0], line[n - 1][1], line[n][0], line[n][1], rect);
         if (s) pts.push((s[0] - lon0) * kx, (s[1] - lat0) * ky, z, (s[2] - lon0) * kx, (s[3] - lat0) * ky, z);
       }
@@ -618,9 +1278,11 @@ function buildBorders() {
 
 // ---------------------------------------------------------------- WMS base map
 
-function getMapTexture(url) {
-  if (state.mapTex?.url === url) return state.mapTex.promise;
-  state.mapTex?.tex?.dispose();
+// One cached texture per slot, so the map under the data and the earth surface do not replace each other
+function getMapTexture(url, slot = 'ground') {
+  const current = state.mapTex[slot];
+  if (current?.url === url) return current.promise;
+  current?.tex?.dispose();
   const entry = { url, tex: null };
   entry.promise = new THREE.TextureLoader().loadAsync(url)
     .then((tex) => {
@@ -631,19 +1293,19 @@ function getMapTexture(url) {
     })
     .catch((e) => {
       console.warn('Base map could not be loaded', e);
-      if (state.mapTex === entry) state.mapTex = null;
+      if (state.mapTex[slot] === entry) delete state.mapTex[slot];
       return null;
     });
-  state.mapTex = entry;
+  state.mapTex[slot] = entry;
   return entry.promise;
 }
 
-// Ground plane under the cube, textured with a WMS GetMap image in CRS:84 (plain lon/lat, which
-// maps linearly onto the scene's x/y).
+// Ground plane under the cube, textured with a WMS GetMap image in the grid's CRS: CRS:84 (plain
+// lon/lat) or the rotated pole projection of a native grid, so the image maps linearly onto x/y.
 function buildGround() {
   disposeChildren(groundGroup);
   if (!state.grid) return;
-  const { lons, lats } = state.grid;
+  const { lons, lats, proj } = state.grid;
   const { px, py, zmin, ext } = state.geo;
   const w = px.at(-1) - px[0], h = py.at(-1) - py[0];
   const mat = new THREE.MeshBasicMaterial({
@@ -657,13 +1319,68 @@ function buildGround() {
   if (!layer) return;
   const iw = 1536, ih = Math.min(2048, Math.round((iw * h) / w));
   const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${encodeURIComponent(layer)}&STYLES=` +
-    `&CRS=CRS:84&BBOX=${lons[0]},${lats[0]},${lons.at(-1)},${lats.at(-1)}` +
+    `&CRS=${proj ? encodeURIComponent(`PROJ4:${proj.proj4}`) : 'CRS:84'}&BBOX=${lons[0]},${lats[0]},${lons.at(-1)},${lats.at(-1)}` +
     `&WIDTH=${iw}&HEIGHT=${ih}&FORMAT=image/png&TRANSPARENT=FALSE`;
   getMapTexture(url).then((tex) => {
     if (!tex || ground.parent !== groundGroup) return;
     mat.map = tex;
     mat.color.setScalar(Number($('mapBrightness').value));
     mat.needsUpdate = true;
+    requestRender();
+  });
+}
+
+// Earth surface around the data: the base map continued over about seven times the data area, with faint
+// degree lines, a little below the map under the data, and darker than it. A reference for height and motion
+// when flying low. In the grid's coordinates, like the map under the data.
+const EARTH_SIZE = 7; // times the width and height of the data area
+const EARTH_BRIGHTNESS = 0.12; // times the map brightness (in linear colour, so this is about 40% as bright as seen): darker than the data area
+
+function buildEarth() {
+  disposeChildren(earthGroup);
+  earthGroup.visible = $('earthOn').checked;
+  if (!state.grid || !earthGroup.visible) return;
+  const { lons, lats, proj } = state.grid;
+  const { lon0, lat0, kx, ky, zmin, ext } = state.geo;
+  const half = (EARTH_SIZE - 1) / 2;
+  const dLon = lons.at(-1) - lons[0], dLat = lats.at(-1) - lats[0];
+  // Around the data area, limited to the coordinate range of the CRS
+  const bbox = [
+    Math.max(-180, lons[0] - half * dLon), Math.max(-90, lats[0] - half * dLat),
+    Math.min(180, lons.at(-1) + half * dLon), Math.min(90, lats.at(-1) + half * dLat),
+  ];
+  const sx = (v) => (v - lon0) * kx, sy = (v) => (v - lat0) * ky;
+  const w = sx(bbox[2]) - sx(bbox[0]), h = sy(bbox[3]) - sy(bbox[1]);
+  const z = zmin - ext * 0.006; // below the map under the data, so that one stays on top
+
+  // Not in the depth haze: the haze colour would lighten it again
+  const mat = new THREE.MeshBasicMaterial({ color: 0x10161c, fog: false, polygonOffset: true, polygonOffsetFactor: 4, polygonOffsetUnits: 4 });
+  const earth = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  earth.position.set((sx(bbox[0]) + sx(bbox[2])) / 2, (sy(bbox[1]) + sy(bbox[3])) / 2, z);
+  earthGroup.add(earth);
+
+  // Degree lines: a reference for motion also without a base map
+  const step = niceStep(Math.max(bbox[2] - bbox[0], bbox[3] - bbox[1]), 24);
+  const pts = [];
+  for (let v = Math.ceil(bbox[0] / step) * step; v <= bbox[2]; v += step) pts.push(sx(v), sy(bbox[1]), z, sx(v), sy(bbox[3]), z);
+  for (let v = Math.ceil(bbox[1] / step) * step; v <= bbox[3]; v += step) pts.push(sx(bbox[0]), sy(v), z, sx(bbox[2]), sy(v), z);
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  const lines = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0x8fa3b8, transparent: true, opacity: 0.12, depthWrite: false, fog: false }));
+  earthGroup.add(lines);
+
+  const layer = $('baseLayer').value;
+  if (!layer) return;
+  const iw = 2048, ih = Math.max(64, Math.min(2048, Math.round((iw * h) / w)));
+  const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${encodeURIComponent(layer)}&STYLES=` +
+    `&CRS=${proj ? encodeURIComponent(`PROJ4:${proj.proj4}`) : 'CRS:84'}&BBOX=${bbox.join(',')}` +
+    `&WIDTH=${iw}&HEIGHT=${ih}&FORMAT=image/png&TRANSPARENT=FALSE`;
+  getMapTexture(url, 'earth').then((tex) => {
+    if (!tex || earth.parent !== earthGroup) return;
+    mat.map = tex;
+    mat.color.setScalar(Number($('mapBrightness').value) * EARTH_BRIGHTNESS);
+    mat.needsUpdate = true;
+    requestRender();
   });
 }
 
@@ -743,6 +1460,12 @@ function sliceGeometry(nu, nv, mapper) {
   return geom;
 }
 
+// Axis text for an x or y value: °E/°N, or rotated degrees on a native rotated pole grid.
+const axisText = (v, axis, digits = 2) => {
+  const n = typeof v === 'number' ? fmt(v, digits) : v;
+  return state.grid?.proj ? `${n}° r${axis === 'x' ? 'lon' : 'lat'}` : `${n}°${axis === 'x' ? 'E' : 'N'}`;
+};
+
 function buildSlices() {
   disposeChildren(sliceGroup);
   const g = state.grid;
@@ -750,8 +1473,8 @@ function buildSlices() {
   const { nx, ny, nz, levels, lons, lats } = g;
   const kz = nz - 1 - Number($('sliceZ').value), ix = Number($('sliceX').value), jy = Number($('sliceY').value);
   $('sliceZOut').textContent = `lvl ${levels[kz]}`;
-  $('sliceXOut').textContent = `${fmt(lons[ix], 2)}°E`;
-  $('sliceYOut').textContent = `${fmt(lats[jy], 2)}°N`;
+  $('sliceXOut').textContent = axisText(lons[ix], 'x');
+  $('sliceYOut').textContent = axisText(lats[jy], 'y');
   const add = (geom) => sliceGroup.add(new THREE.Mesh(geom, sliceMaterial));
   if ($('sliceZOn').checked) add(sliceGeometry(nx, ny, (u, v) => [u, v, kz]));
   if (nz > 1 && $('sliceXOn').checked) add(sliceGeometry(ny, nz, (u, v) => [ix, u, v]));
@@ -828,17 +1551,116 @@ function disposeIso(iso) {
   iso.mesh = null;
 }
 
+// Isosurfaces of large grids are computed in a worker, so sliders stay smooth; small grids directly, which
+// is faster than copying the field. Only the newest value is computed: while the worker is busy, a newer
+// value waits and replaces older waiting ones. The previous surface stays until the new one arrives. While
+// only the volume is shown the surface is not computed at all; it is built when the isosurface is shown.
+const WORKER_MIN_POINTS = 500000;
+const isoWorker = (() => {
+  try {
+    return new Worker(new URL('./isoworker.js', import.meta.url), { type: 'module' });
+  } catch (e) {
+    console.warn('No isosurface worker, computing on the main thread', e);
+    return null;
+  }
+})();
+let isoRequest = 0, gridUid = 0, workerFieldKey = null, isoWorkerFailed = false;
+const isoRequests = new Map(); // request id → iso
+
+// Identifies the field and heights the worker has: the grid, the parameter and the vertical coordinate
+const isoFieldKey = (g) => `${(g.uid ??= ++gridUid)}:${g.param}:${g.vmode}:${state.geo.zmax}`;
+
+function sendFieldToWorker(g, key) {
+  if (workerFieldKey === key) return;
+  const { px, py, pz } = state.geo;
+  isoWorker.postMessage({ type: 'field', key, field: g.data[g.param], nx: g.nx, ny: g.ny, nz: g.nz, px, py, pz }); // copied
+  workerFieldKey = key;
+}
+
+isoWorker?.addEventListener('message', ({ data }) => {
+  const iso = isoRequests.get(data.id);
+  isoRequests.delete(data.id);
+  if (!iso) return;
+  iso.busy = false;
+  const g = state.grid;
+  const current = g && state.isos.includes(iso) && iso.visible && !iso.dirty && isoGroup.visible;
+  if (!current) return;
+  if (data.error) {
+    // Not again in the worker (that would repeat the error): compute this one on the main thread
+    console.warn('Isosurface worker failed, computing on the main thread:', data.error);
+    computeIsoHere(iso);
+    return;
+  }
+  if (data.key === isoFieldKey(g)) showIsoResult(iso, data, data.ms);
+  // A newer value (or another grid) was asked for meanwhile: compute that one now
+  if (iso.wanted !== data.value || data.key !== isoFieldKey(g)) requestIso(iso);
+});
+// The worker could not be started or loaded (e.g. an old cached module): from now on compute on the main thread
+for (const type of ['error', 'messageerror']) {
+  isoWorker?.addEventListener(type, (e) => {
+    console.warn(`Isosurface worker ${type}, computing on the main thread from now on`, e);
+    isoWorkerFailed = true;
+    const waiting = [...new Set(isoRequests.values())];
+    isoRequests.clear();
+    for (const iso of waiting) {
+      iso.busy = false;
+      if (state.isos.includes(iso)) buildIso(iso);
+    }
+  });
+}
+
+function requestIso(iso) {
+  const g = state.grid;
+  iso.wanted = iso.value;
+  if (iso.busy) return; // the result handler asks again for the newest value
+  const key = isoFieldKey(g);
+  sendFieldToWorker(g, key);
+  const id = ++isoRequest;
+  iso.busy = true;
+  isoRequests.set(id, iso);
+  iso.el.info.textContent = 'computing…';
+  isoWorker.postMessage({ type: 'build', id, key, value: iso.value });
+}
+
 function buildIso(iso) {
-  disposeIso(iso);
   const g = state.grid;
   if (!g || !iso.visible || g.nz < 2) {
+    disposeIso(iso);
     iso.el.info.textContent = g && g.nz < 2 ? 'need ≥ 2 levels' : '';
     return;
   }
+  if (!isoGroup.visible) {
+    // Only the volume is shown: compute the surface when it is shown
+    disposeIso(iso);
+    iso.dirty = true;
+    iso.el.info.textContent = 'computed when the isosurface is shown';
+    return;
+  }
+  iso.dirty = false;
+  if (isoWorker && !isoWorkerFailed && g.nx * g.ny * g.nz >= WORKER_MIN_POINTS) {
+    requestIso(iso);
+    return;
+  }
+  computeIsoHere(iso);
+}
+
+function computeIsoHere(iso) {
+  const g = state.grid;
   const { px, py, pz } = state.geo;
   const t0 = performance.now();
-  const r = marchingCubes(g.data[g.param], g.nx, g.ny, g.nz, iso.value, px, py, pz);
-  const ms = performance.now() - t0;
+  try {
+    const r = marchingCubes(g.data[g.param], g.nx, g.ny, g.nz, iso.value, px, py, pz);
+    showIsoResult(iso, r, performance.now() - t0);
+  } catch (e) {
+    console.error(e);
+    disposeIso(iso);
+    iso.el.info.textContent = `isosurface failed: ${e.message}`;
+  }
+}
+
+function showIsoResult(iso, r, ms) {
+  disposeIso(iso);
+  requestRender();
   const tris = r.indices.length / 3;
   iso.el.info.textContent = tris ? `${tris.toLocaleString()} triangles · ${ms.toFixed(0)} ms` : 'value not crossed in this cube';
   if (!tris) return;
@@ -864,7 +1686,16 @@ function buildIso(iso) {
   isoGroup.add(iso.mesh);
 }
 
+// Particle starting points follow the threshold, but only once the slider settles: on a large grid finding
+// them takes a moment
+let streamlineTimer = 0;
+function scheduleStreamlines() {
+  clearTimeout(streamlineTimer);
+  streamlineTimer = setTimeout(() => { if (state.grid?.wind) { buildStreamlines(); requestRender(); } }, 250);
+}
+
 function updateIsoLines() {
+  if (state.grid?.wind) scheduleStreamlines();
   const vis = state.isos.filter((i) => i.visible).slice(0, MAX_ISO_LINES);
   const on = $('isoLinesOn').checked;
   sliceUniforms.isoCount.value = on ? vis.length : 0;
@@ -938,12 +1769,23 @@ function buildLabels() {
     labelGroup.add(l);
   };
   const lonStep = niceStep(lons.at(-1) - lons[0], 6);
-  for (let l = Math.ceil(lons[0] / lonStep) * lonStep; l <= lons.at(-1); l += lonStep) add(`${+l.toFixed(2)}°E`, (l - lon0) * kx, py[0] - pad, z0);
+  for (let l = Math.ceil(lons[0] / lonStep) * lonStep; l <= lons.at(-1); l += lonStep) add(axisText(`${+l.toFixed(2)}`, 'x'), (l - lon0) * kx, py[0] - pad, z0);
   const latStep = niceStep(lats.at(-1) - lats[0], 6);
-  for (let l = Math.ceil(lats[0] / latStep) * latStep; l <= lats.at(-1); l += latStep) add(`${+l.toFixed(2)}°N`, px[0] - pad * 1.6, (l - lat0) * ky, z0);
+  for (let l = Math.ceil(lats[0] / latStep) * latStep; l <= lats.at(-1); l += latStep) add(axisText(`${+l.toFixed(2)}`, 'y'), px[0] - pad * 1.6, (l - lat0) * ky, z0);
 
   const x = px[0] - pad, y = py.at(-1) + pad; // vertical axis on the north-west corner
-  if (vmode === 'pressure') {
+  const vkind = state.grid.vkind;
+  if (vkind === 'pressure' || vkind === 'height') {
+    // A label per level at its height, skipping levels too close to the previous label
+    const text = VERTICAL_KINDS[vkind].text;
+    let lastZ = -Infinity;
+    for (let k = levels.length - 1; k >= 0; k--) {
+      const z = state.geo.pz[k * state.grid.nx * state.grid.ny] * s;
+      if (z - lastZ < 1.4 * h && k !== 0) continue;
+      add(text(levels[k]), x, y, z);
+      lastZ = z;
+    }
+  } else if (vmode === 'pressure') {
     const kmMax = zmax / KM_SCALE, step = niceStep(kmMax, Math.max(1, Math.min(8, Math.floor((zmax * s) / (1.4 * h)))));
     for (let km = 0; km <= kmMax; km += step) add(`${km} km`, x, y, km * KM_SCALE * s);
   } else {
@@ -952,7 +1794,9 @@ function buildLabels() {
     const step = [1, 2, 5, 10, 20, 40, 80].find((st) => room / Math.max(1, (nz - 1) / st) >= 1.4 * h) ?? 100;
     for (let k = 0; k < nz; k++) {
       const end = k === 0 || k === nz - 1, nearEnd = Math.min(k, nz - 1 - k) < step / 2;
-      if (end || (levels[k] % step === 0 && !nearEnd)) add(`L${levels[k]}`, x, y, (nz - 1 - k) * levelSpacing * s);
+      // Round level numbers when every level is loaded; with a vertical step every step-th loaded level
+      const pick = levels[1] - levels[0] > 1 ? k % step === 0 : levels[k] % step === 0;
+      if (end || (pick && !nearEnd)) add(`L${levels[k]}`, x, y, (nz - 1 - k) * levelSpacing * s);
     }
   }
 }
@@ -962,9 +1806,12 @@ function applyVScale() {
   dataGroup.scale.z = s;
   $('vscale').nextElementSibling.textContent = `×${s.toFixed(s < 1 ? 2 : 1)}`;
   buildLabels();
+  syncViewControls();
 }
 
 function fitCamera() {
+  stopFlight(); // a new view starts at rest
+  attitude.bank = attitude.nose = 0;
   if (!state.geo) return;
   const { ext, zmin, zmax } = state.geo;
   const s = vscale(), zmid = ((zmin + zmax) / 2) * s;
@@ -977,13 +1824,71 @@ function fitCamera() {
   controls.update();
 }
 
+// The controls in the 3D view mirror panel controls: the parameter shown, the first isosurface value and the
+// vertical scale. They change the panel controls, which stay the single source of truth.
+function syncViewControls() {
+  const keep = (el) => el === document.activeElement; // do not overwrite what the user is typing or dragging
+  // Copies the options of a panel select and shows the loaded value (or the panel value before anything is loaded)
+  const mirror = (src, sel, shown) => {
+    const same = sel.options.length === src.options.length && [...src.options].every((o, n) => sel.options[n].value === o.value);
+    if (!same) {
+      sel.innerHTML = '';
+      for (const o of src.options) sel.append(option(o.value, o.textContent));
+    }
+    if (!keep(sel)) sel.value = shown != null && [...src.options].some((o) => o.value === shown) ? shown : src.value;
+  };
+  mirror($('parameter'), $('vcParam'), state.grid?.selection ?? state.grid?.param);
+  // Streamlines toggle, only for the derived wind
+  $('vcStreamWrap').hidden = !state.grid?.wind;
+  const sameInstance = state.grid && state.grid.instance === $('instance').value;
+  mirror($('datetime'), $('vcTime'), sameInstance ? state.grid.datetime : null);
+  const t = $('vcTime');
+  $('vcTimePrev').disabled = t.selectedIndex <= 0;
+  $('vcTimeNext').disabled = t.selectedIndex < 0 || t.selectedIndex >= t.options.length - 1;
+
+  const iso = state.isos[0];
+  $('vcThresholdWrap').hidden = !iso;
+  if (iso) {
+    const range = $('vcThreshold'), num = $('vcThresholdNum');
+    for (const a of ['min', 'max', 'step']) range[a] = iso.el.range[a];
+    num.step = iso.el.range.step;
+    if (!keep(range)) range.value = iso.value;
+    if (!keep(num)) num.value = iso.value;
+    $('vcUnit').textContent = state.grid?.unit || '';
+  }
+
+  // Render style: isosurface, or the volume with its style ('both' shows as the volume style)
+  if (!keep($('vcRender'))) $('vcRender').value = $('renderMode').value === 'iso' ? 'iso' : `vol-${$('volStyle').value}`;
+
+  // Volume density, only for the volume
+  $('vcDensityWrap').hidden = $('renderMode').value === 'iso';
+  if (!keep($('vcDensity'))) $('vcDensity').value = $('volDensity').value;
+  $('vcDensityOut').textContent = $('volDensity').nextElementSibling.textContent;
+
+  if (!keep($('vcVscale'))) $('vcVscale').value = $('vscale').value;
+  $('vcVscaleOut').textContent = `×${vscale().toFixed(vscale() < 1 ? 2 : 1)}`;
+}
+
+// "levels 1–90", "levels 1–88 every 3", "300–850 hPa (3 levels)", "10000–100 m (9 levels)"
+function levelsText(g) {
+  const first = g.levels[0], last = g.levels.at(-1);
+  if (g.vkind === 'pressure' || g.vkind === 'height') return `${first}–${last} ${VERTICAL_KINDS[g.vkind].unit} (${g.nz} levels)`;
+  const step = g.nz > 1 ? g.levels[1] - g.levels[0] : 1;
+  return `levels ${first}–${last}${step > 1 ? ` every ${step}` : ''}`;
+}
+
 function updateHud() {
+  syncViewControls();
   const g = state.grid;
   if (!g) { $('hud').innerHTML = ''; return; }
   const isoTxt = state.isos.filter((i) => i.visible).map((i) => `${fmt(i.value)} ${g.unit}`).join(', ');
   $('hud').innerHTML =
-    `<b>${g.param}</b> · ${g.datetime || ''}<br>` +
-    `run ${g.instance || '–'} · levels ${g.levels[0]}–${g.levels.at(-1)} · ${g.nx}×${g.ny}×${g.nz}<br>` +
+    `<b>${g.wind ? `wind (${g.wind.speed} + ${g.wind.dir})` : g.param}</b> · ${g.datetime || ''}<br>` +
+    `run ${g.instance || '–'} · ${levelsText(g)} · ${g.nx}×${g.ny}×${g.nz}` +
+    `${g.proj ? ' · native rotated pole grid' : ''}<br>` +
+    `read ${fmtCount(g.valuesRead)} values (${g.sourceSize.join('×')} × ${g.nz} levels${Object.keys(g.data).length > 1 ? ` × ${Object.keys(g.data).length} parameters` : ''})` +
+    `${g.valuesMissing ? `, ${fmtCount(g.valuesMissing)} without data` : ''}` +
+    `${g.stride > 1 ? ` · shown as ${fmtCount(g.nx * g.ny * g.nz)} points (${g.stride}×${g.stride} averaged)` : ''}<br>` +
     `range ${fmt(g.min)} … ${fmt(g.max)} ${g.unit}` + (isoTxt ? `<br>isosurface ${isoTxt}` : '');
 }
 
@@ -1008,12 +1913,22 @@ function pick() {
   const ijk = THREE.Triangle.getInterpolation(local, tri[0], tri[1], tri[2], triIjk[0], triIjk[1], triIjk[2], new THREE.Vector3());
   const iso = hit.object.userData.iso;
   const value = iso ? iso.value : sampleField(g.data[g.param], ijk.x, ijk.y, ijk.z);
+  const x = lerpArr(g.lons, ijk.x), y = lerpArr(g.lats, ijk.y);
+  const [lon, lat] = g.proj ? g.proj.toGeo(x, y) : [x, y];
   const lines = [
     `<b>${fmt(value, 2)} ${g.unit}</b>${iso ? ' (isosurface)' : ''}`,
-    `${fmt(lerpArr(g.lons, ijk.x), 3)}°E ${fmt(lerpArr(g.lats, ijk.y), 3)}°N`,
-    `model level ${fmt(lerpArr(g.levels, ijk.z), 1)}`,
+    `${fmt(lon, 3)}°E ${fmt(lat, 3)}°N`,
+    ...(g.proj ? [`grid ${fmt(x, 3)}° rlon ${fmt(y, 3)}° rlat`] : []),
+    g.vkind === 'pressure' || g.vkind === 'height'
+      ? `${fmt(lerpArr(g.levels, ijk.z), 0)} ${VERTICAL_KINDS[g.vkind].unit}`
+      : `model level ${fmt(lerpArr(g.levels, ijk.z), 1)}`,
   ];
-  const p = g.data[PRESSURE_PARAM];
+  if (g.wind) {
+    const n = (Math.round(ijk.z) * g.ny + Math.round(ijk.y)) * g.nx + Math.round(ijk.x);
+    const d = g.data[g.wind.dir][n];
+    if (d === d) lines.splice(1, 0, `wind from ${fmt(d, 0)}°`);
+  }
+  const p = g.data[g.pressureParam];
   if (p) {
     const hpa = sampleField(p, ijk.x, ijk.y, ijk.z);
     lines.push(`${fmt(hpa, 1)} hPa ≈ ${fmt(isaAltitudeKm(hpa), 2)} km`);
@@ -1069,10 +1984,30 @@ $('fullDomain').addEventListener('click', () => {
   loadData();
 });
 
-function applyPreset(p) {
+async function applyPreset(p) {
+  if (p.collectionUrl && p.collectionUrl !== state.collectionUrl) {
+    state.abort?.abort();
+    $('collectionUrl').value = p.collectionUrl;
+    try {
+      await loadCollection(p.collectionUrl, { parameter: p.parameter, crs: p.crs });
+    } catch (e) {
+      console.error(e);
+      // Nothing of the new collection was loaded: show the URL of the one still shown, not the one that failed
+      $('collectionUrl').value = state.collectionUrl || '';
+      setStatus(`Could not open ${p.collectionUrl} (${e.message}); still showing ${state.collectionUrl || 'nothing'}`, true);
+      return;
+    }
+  }
   if (!state.collection) {
     setStatus('Collection metadata not loaded yet', true);
     return;
+  }
+  if (p.crs != null) {
+    if (p.crs === 'native' && !state.native) {
+      setStatus('This collection does not offer its native grid (crs=native)', true);
+      return;
+    }
+    $('gridCrs').value = p.crs === 'native' ? state.native.crs : '';
   }
   const bbox = p.bbox === 'full' ? fullDomainBBox() : p.bbox;
   if (bbox) setBBox(bbox);
@@ -1084,6 +2019,14 @@ function applyPreset(p) {
     $('parameter').value = p.parameter;
   }
   if (p.stride != null) $('stride').value = String(p.stride);
+  if (p.levelStep != null) $('levelStep').value = String(p.levelStep);
+  if (p.gridCells != null) $('gridOn').checked = p.gridCells; // drawn when the data is shown
+  if (p.earth != null) $('earthOn').checked = p.earth;
+  if (p.sky != null) {
+    $('skyOn').checked = p.sky;
+    skyGroup.visible = p.sky;
+  }
+  if (p.concurrency != null) $('concurrency').value = p.concurrency;
   if (p.levels === 'all') {
     $('levelFrom').value = $('levelFrom').min || 1;
     $('levelTo').value = $('levelTo').max || 90;
@@ -1095,6 +2038,7 @@ function applyPreset(p) {
     applyRenderMode();
   }
   if (p.volStyle != null) $('volStyle').value = p.volStyle;
+  if (p.density != null) $('volDensity').value = Math.log10(p.density); // the slider is logarithmic
   if (p.threshold != null) {
     const iso = state.isos[0] || addIso(p.threshold);
     iso.value = p.threshold;
@@ -1114,20 +2058,122 @@ for (const p of PRESETS) {
   b.addEventListener('click', () => applyPreset(p));
   $('presetList').append(b);
 }
-$('load').addEventListener('click', loadData);
-$('cancel').addEventListener('click', () => state.abort?.abort());
-$('collectionUrl').addEventListener('change', () =>
-  loadCollection($('collectionUrl').value, { parameter: $('parameter').value, datetime: $('datetime').value })
-    .then(() => setStatus('Collection loaded'))
-    .catch((e) => setStatus(e.message, true)));
+$('load').addEventListener('click', () => loadData({ force: true })); // always from the server
+$('cancel').addEventListener('click', () => { stopAnimation(); state.abort?.abort(); });
+// Reads the collection in the URL field when it is not the loaded one, keeping the current choices where possible.
+// The URL field takes an EDR endpoint (…/edr) or a collection URL (…/edr/collections/{id}). An endpoint lists
+// its collections that have at least two levels and a cube query, and opens the current one if it is among
+// them, otherwise the first. Any opened collection lists its neighbours, so you can switch between them.
+const COLLECTION_URL = /^(.*)\/collections\/([^/?#]+)\/?$/;
+const collectionLists = new Map(); // endpoint → promise of [{ id, url, label }]
+
+function listCollections(endpoint) {
+  if (!collectionLists.has(endpoint)) {
+    const promise = fetchJSON(`${endpoint}/collections`, { retries: 1 }).then((json) => (json.collections || [])
+      .filter((c) => (c.extent?.vertical?.values?.length ?? 0) >= 2 && (!c.data_queries || c.data_queries.cube))
+      .map((c) => {
+        const v = verticalOf(c);
+        const range = v.values.length ? ` (${v.values.at(-1) === v.values[0] ? v.values[0] : `${Math.min(...v.values)}–${Math.max(...v.values)}`}${v.unit ? ` ${v.unit}` : ''})` : '';
+        return { id: c.id, url: `${endpoint}/collections/${encodeURIComponent(c.id)}`, label: `${c.title && c.title !== c.id ? `${c.title} – ` : ''}${c.id}: ${v.values.length} ${v.label}${range}` };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id)));
+    promise.catch(() => collectionLists.delete(endpoint)); // try again next time
+    collectionLists.set(endpoint, promise);
+  }
+  return collectionLists.get(endpoint);
+}
+
+function fillCollectionList(items, selectedUrl) {
+  const sel = $('collectionList');
+  sel.innerHTML = '';
+  for (const item of items) sel.append(option(item.url, item.label));
+  if (selectedUrl && !items.some((i) => i.url === selectedUrl)) sel.prepend(option(selectedUrl, `${selectedUrl.split('/').pop()} (not in the list)`));
+  if (selectedUrl) sel.value = selectedUrl;
+  $('collectionListWrap').hidden = sel.options.length === 0;
+  $('collectionListCount').textContent = `${items.length} with levels`;
+}
+
+// Shows the neighbours of an opened collection in the list (in the background; failures only hide the list)
+async function showCollectionNeighbours(collectionUrl) {
+  const m = COLLECTION_URL.exec(collectionUrl);
+  if (!m) return;
+  try {
+    const items = await listCollections(m[1]);
+    if (state.collectionUrl === collectionUrl) fillCollectionList(items, collectionUrl);
+  } catch (e) {
+    console.warn('Could not list the collections of', m[1], e);
+  }
+}
+
+async function openCollection({ loadAfter = false } = {}) {
+  const text = $('collectionUrl').value.trim().replace(/\/+$/, '');
+  if (!text) {
+    setStatus('Enter an EDR endpoint or collection URL', true);
+    return;
+  }
+  if (COLLECTION_URL.test(text)) {
+    await openCollectionUrl(text, { loadAfter });
+    return;
+  }
+  // An endpoint: list its collections with levels
+  const endpoint = text.replace(/\/collections$/, '');
+  setStatus(`Listing the collections of ${endpoint}…`);
+  let items;
+  try {
+    items = await listCollections(endpoint);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Could not list the collections of ${endpoint} (${e.message})`, true);
+    return;
+  }
+  if (!items.length) {
+    setStatus(`${endpoint} has no collections with levels`, true);
+    return;
+  }
+  const choice = items.find((i) => i.url === state.collectionUrl) || items[0];
+  fillCollectionList(items, choice.url);
+  setStatus(`${items.length} collections with levels at ${endpoint}`);
+  await openCollectionUrl(choice.url, { loadAfter });
+}
+
+async function openCollectionUrl(url, { loadAfter = false } = {}) {
+  try {
+    if (url !== state.collectionUrl) {
+      // Enter followed by leaving the field must not read the collection twice
+      if (state.openingCollection?.url !== url) {
+        const prefer = { parameter: $('parameter').value, datetime: $('datetime').value, crs: $('gridCrs').value || undefined };
+        state.openingCollection = { url, promise: loadCollection(url, prefer) };
+      }
+      const opening = state.openingCollection;
+      try {
+        await opening.promise;
+      } finally {
+        if (state.openingCollection === opening) state.openingCollection = null;
+      }
+      setStatus('Collection loaded');
+    }
+    if (loadAfter) await loadData();
+  } catch (e) {
+    console.error(e);
+    setStatus(e.message, true);
+  }
+}
+$('collectionList').addEventListener('change', () => openCollectionUrl($('collectionList').value, { loadAfter: true }));
+$('openCollection').addEventListener('click', () => openCollection({ loadAfter: true }));
+$('collectionUrl').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault(); // a URL has no line breaks
+  openCollection({ loadAfter: true });
+});
+$('collectionUrl').addEventListener('change', () => openCollection());
 $('instance').addEventListener('change', () => updateDatetimes());
 $('vmode').addEventListener('change', () => {
-  if (state.grid && (state.grid.data[PRESSURE_PARAM] || $('vmode').value === 'level')) {
+  if (state.grid && (state.grid.data[state.grid.pressureParam] || $('vmode').value === 'level')) {
     state.grid.vmode = $('vmode').value;
     rebuildAll();
     fitCamera();
   } else if (state.grid) {
-    setStatus('Pressure altitude needs air_pressure_ml — press Load');
+    setStatus(`Pressure altitude needs ${pressureParamOf(state.collection)} — press Load`);
   }
 });
 
@@ -1144,7 +2190,7 @@ $('renderMode').addEventListener('change', applyRenderMode);
 for (const id of ['volStyle', 'volColor', 'volWidth', 'volDensity', 'volSteps']) {
   $(id).addEventListener('input', updateVolumeSettings);
 }
-$('cancel2').addEventListener('click', () => state.abort?.abort());
+$('cancel2').addEventListener('click', () => { stopAnimation(); state.abort?.abort(); });
 $('addIso').addEventListener('click', () => {
   const g = state.grid;
   addIso(g ? +((g.min + g.max) / 2).toFixed(1) : 0);
@@ -1167,12 +2213,86 @@ $('autoRange').addEventListener('change', () => {
   }
 });
 $('vscale').addEventListener('input', applyVScale);
+
+// Controls in the 3D view: they set the panel controls and fire the same events
+$('vcParam').addEventListener('change', () => {
+  $('parameter').value = $('vcParam').value;
+  loadData();
+});
+$('parameter').addEventListener('change', syncViewControls);
+const showTime = (value) => {
+  if (!value) return;
+  $('datetime').value = value;
+  $('vcTime').value = value;
+  syncViewControls();
+  loadData();
+};
+$('vcTime').addEventListener('change', () => showTime($('vcTime').value));
+$('vcTimePrev').addEventListener('click', () => showTime($('vcTime').options[$('vcTime').selectedIndex - 1]?.value));
+$('vcTimeNext').addEventListener('click', () => showTime($('vcTime').options[$('vcTime').selectedIndex + 1]?.value));
+$('datetime').addEventListener('change', syncViewControls);
+$('vcStream').addEventListener('change', buildStreamlines);
+for (const id of ['renderMode', 'volStyle', 'volWidth']) $(id).addEventListener('input', scheduleStreamlines);
+$('vcRender').addEventListener('change', () => {
+  const v = $('vcRender').value;
+  if (v === 'iso') {
+    $('renderMode').value = 'iso';
+  } else {
+    $('renderMode').value = 'volume';
+    $('volStyle').value = v.slice(4);
+  }
+  applyRenderMode();
+  updateVolumeSettings();
+  syncViewControls();
+});
+$('renderMode').addEventListener('change', syncViewControls);
+$('volStyle').addEventListener('input', syncViewControls);
+$('vcPlay').addEventListener('click', () => (anim.playing ? stopAnimation() : startAnimation()));
+const setThreshold = (value) => {
+  const iso = state.isos[0];
+  if (!iso || !Number.isFinite(value)) return;
+  iso.el.num.value = value;
+  iso.el.num.dispatchEvent(new Event('input')); // same path as typing in the panel: rebuilds surface, lines and volume
+};
+$('vcThreshold').addEventListener('input', () => {
+  $('vcThresholdNum').value = $('vcThreshold').value;
+  setThreshold(Number($('vcThreshold').value));
+});
+$('vcThresholdNum').addEventListener('input', () => {
+  $('vcThreshold').value = $('vcThresholdNum').value;
+  setThreshold(Number($('vcThresholdNum').value));
+});
+$('vcDensity').addEventListener('input', () => {
+  $('volDensity').value = $('vcDensity').value;
+  updateVolumeSettings();
+  syncViewControls();
+});
+$('volDensity').addEventListener('input', syncViewControls);
+$('vcVscale').addEventListener('input', () => {
+  $('vscale').value = $('vcVscale').value;
+  applyVScale();
+});
 $('bordersOn').addEventListener('change', () => (mapGroup.visible = $('bordersOn').checked));
-$('baseLayer').addEventListener('change', buildGround);
+$('baseLayer').addEventListener('change', () => { buildGround(); buildEarth(); });
+$('earthOn').addEventListener('change', buildEarth);
 $('mapBrightness').addEventListener('input', () => {
   const mat = groundGroup.children[0]?.material;
   if (mat?.map) mat.color.setScalar(Number($('mapBrightness').value));
+  const earthMat = earthGroup.children[0]?.material;
+  if (earthMat?.map) earthMat.color.setScalar(Number($('mapBrightness').value) * EARTH_BRIGHTNESS);
 });
+$('gridOn').addEventListener('change', buildGridCells);
+$('skyOn').addEventListener('change', () => (skyGroup.visible = $('skyOn').checked));
+
+// Collapsible panel, remembered in this browser (storage may be unavailable, e.g. in a private window)
+function setPanelHidden(hidden) {
+  document.body.classList.toggle('panel-hidden', hidden);
+  $('showPanel').hidden = !hidden;
+  try { localStorage.setItem('panelHidden', hidden ? '1' : '0'); } catch { /* not remembered */ }
+}
+$('hidePanel').addEventListener('click', () => setPanelHidden(true));
+$('showPanel').addEventListener('click', () => setPanelHidden(false));
+try { if (localStorage.getItem('panelHidden') === '1') setPanelHidden(true); } catch { /* default: shown */ }
 $('boxOn').addEventListener('change', () => (boxGroup.visible = $('boxOn').checked));
 $('labelsOn').addEventListener('change', () => (labelGroup.visible = $('labelsOn').checked));
 $('resetView').addEventListener('click', fitCamera);
@@ -1187,4 +2307,4 @@ applyVScale();
 updateColormap();
 loadBorders();
 loadBaseLayers();
-applyUrl();
+applyPreset(PRESETS[0]); // the first preset is the start view

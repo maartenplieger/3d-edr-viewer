@@ -1,6 +1,6 @@
 // Marching cubes over a regular (i, j, k) grid whose vertices may be displaced vertically
 // (terrain-following / pressure-based heights).
-import { edgeTable, triTable } from 'three/addons/objects/MarchingCubes.js';
+import { edgeTable, triTable } from './mctables.js';
 
 // Corner and edge numbering as in Paul Bourke's tables (used by three.js).
 const CORNERS = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]];

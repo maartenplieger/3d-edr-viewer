@@ -4,20 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EDR 3D Viewer</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="style.css">
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
-        "topojson-client": "https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/+esm"
-      }
-    }
-  </script>
 </head>
 <body>
   <aside id="panel">
     <header>
+      <button id="hidePanel" class="icon panel-toggle" title="Hide the controls (more room for the 3D view)">«</button>
       <h1>EDR 3D Viewer</h1>
       <p class="sub">OGC API – EDR cube → WebGL isosurfaces</p>
     </header>
@@ -29,19 +22,24 @@
 
     <details open>
       <summary>Data</summary>
-      <label class="stack">EDR cube URL
-        <textarea id="url" rows="4" spellcheck="false"></textarea>
-      </label>
-      <button id="applyUrl" class="primary">Apply URL &amp; load</button>
-
-      <label class="stack">Collection URL
-        <input id="collectionUrl" type="text" spellcheck="false">
-      </label>
+      <div class="collection-url">
+        <label for="collectionUrl">EDR endpoint or collection URL</label>
+        <textarea id="collectionUrl" rows="2" spellcheck="false" placeholder="https://…/edr  or  https://…/edr/collections/{id}"
+          title="An endpoint lists its collections with levels; a collection URL opens that collection. Press Enter or Open."></textarea>
+        <button id="openCollection" class="primary">Open</button>
+        <label id="collectionListWrap" class="stack collection-list" hidden>
+          <span>Collection <span id="collectionListCount" class="muted"></span></span>
+          <select id="collectionList" title="Collections of this endpoint with at least two levels"></select>
+        </label>
+      </div>
       <div class="row">
         <label class="stack grow">Instance <select id="instance"></select></label>
         <label class="stack grow">Time <select id="datetime"></select></label>
       </div>
       <label class="stack">Parameter <select id="parameter"></select></label>
+      <label class="stack" title="Grid of the returned data: resampled to lon/lat, or the model's own grid when the collection offers it (crs=native)">Grid
+        <select id="gridCrs"></select>
+      </label>
       <div class="grid4">
         <label class="stack">West <input id="bboxW" type="number" step="0.1"></label>
         <label class="stack">South <input id="bboxS" type="number" step="0.1"></label>
@@ -62,9 +60,18 @@
             <option value="4">4</option>
           </select>
         </label>
+        <label class="stack grow" title="Load every n-th model level between level from and level to: fewer levels, faster loading">Vertical step
+          <select id="levelStep">
+            <option value="1" selected>1 (every level)</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+          </select>
+        </label>
       </div>
       <div class="row">
-        <label class="stack grow">Level from <input id="levelFrom" type="number" min="1" value="10"></label>
+        <label class="stack grow">Level from <input id="levelFrom" type="number" min="1" value="1"></label>
         <label class="stack grow">Level to <input id="levelTo" type="number" min="1" value="90"></label>
       </div>
       <label class="stack">Vertical coordinate
@@ -95,6 +102,14 @@
       <progress id="progress" max="1" value="0"></progress>
       <div id="status" class="status"></div>
       <a id="requestUrl" class="request" target="_blank" rel="noopener"></a>
+
+      <details class="subsection">
+        <summary>Paste a cube URL</summary>
+        <label class="stack">Takes collection, instance, time, bbox, levels and crs from an EDR cube URL
+          <textarea id="url" rows="4" spellcheck="false"></textarea>
+        </label>
+        <button id="applyUrl">Apply URL &amp; load</button>
+      </details>
     </details>
 
     <details open>
@@ -178,8 +193,11 @@
       <div class="row wrap">
         <label class="check"><input id="bordersOn" type="checkbox"> Vector borders</label>
         <label class="check"><input id="boxOn" type="checkbox" checked> Box</label>
+        <label class="check" title="Draw the grid cells in use: cell edges on the ground, columns and levels on two walls"><input id="gridOn" type="checkbox"> Grid cells</label>
         <label class="check"><input id="labelsOn" type="checkbox" checked> Labels</label>
       </div>
+      <label class="check" title="A reference while flying: sky, horizon and stars, infinitely far away"><input id="skyOn" type="checkbox"> Sky with horizon and stars</label>
+      <label class="check" title="The base map continued around the data (about 7× the area) with degree lines"><input id="earthOn" type="checkbox"> Earth surface around the data</label>
       <label class="check"><input id="hazeOn" type="checkbox" checked> Depth haze (fade distant data)</label>
       <label class="slider">Haze amount <input id="hazeAmount" type="range" min="0.05" max="1" step="0.05" value="0.4"><output></output></label>
       <button id="resetView">Reset view</button>
@@ -188,7 +206,64 @@
 
   <main id="view">
     <canvas id="c"></canvas>
+    <div id="viewControls" class="view-controls" aria-label="View controls">
+      <button id="showPanel" class="icon show-panel" title="Show the controls" hidden>☰</button>
+      <label class="vc-param">Parameter
+        <select id="vcParam" title="Parameter shown; changing it loads the new parameter"></select>
+      </label>
+      <label class="vc-time">Time
+        <span class="vc-inline">
+          <button id="vcTimePrev" class="icon" title="Previous time">‹</button>
+          <select id="vcTime" title="Time shown; changing it loads that time"></select>
+          <button id="vcTimeNext" class="icon" title="Next time">›</button>
+          <button id="vcPlay" class="icon play" title="Animate over time">▶</button>
+          <select id="vcSpeed" class="speed" title="Time per frame (at least; loading a new time can take longer)">
+            <option value="250">0.25 s</option>
+            <option value="500" selected>0.5 s</option>
+            <option value="1000">1 s</option>
+            <option value="2000">2 s</option>
+          </select>
+          <span id="vcAnimInfo" class="vc-unit"></span>
+        </span>
+      </label>
+      <div class="vc-column">
+        <label id="vcThresholdWrap" class="vc-threshold" title="First isosurface value, also the volume's fill threshold">Threshold
+          <span class="vc-inline">
+            <input id="vcThreshold" type="range" step="0.1">
+            <input id="vcThresholdNum" type="number" step="0.1">
+            <span id="vcUnit" class="vc-unit"></span>
+          </span>
+        </label>
+        <label id="vcDensityWrap" class="vc-density" title="Opacity of the volume">Density
+          <span class="vc-inline">
+            <input id="vcDensity" type="range" min="-1.3" max="1.3" step="0.01">
+            <output id="vcDensityOut"></output>
+          </span>
+        </label>
+      </div>
+      <label class="vc-render">Show as
+        <select id="vcRender" title="How the threshold is drawn">
+          <option value="vol-0">Volume – fill above</option>
+          <option value="vol-1">Volume – fill below</option>
+          <option value="vol-2">Volume – band around</option>
+          <option value="iso">Isosurface</option>
+        </select>
+      </label>
+      <label id="vcStreamWrap" class="vc-check" title="Particles moving with the wind, inside the volume" hidden>
+        <span class="vc-inline"><input id="vcStream" type="checkbox" checked> Streamlines</span>
+      </label>
+      <label class="vc-vscale">Vertical scale
+        <span class="vc-inline">
+          <input id="vcVscale" type="range" min="-1" max="1.5" step="any">
+          <output id="vcVscaleOut"></output>
+        </span>
+      </label>
+    </div>
     <div id="hud"></div>
+    <div id="flightInfo" class="flight-info" aria-live="off"></div>
+    <div class="keys-hint">Fly: <kbd>W</kbd><kbd>S</kbd> faster/slower · <kbd>A</kbd><kbd>D</kbd> sideways ·
+      <kbd>Q</kbd><kbd>E</kbd> down/up · <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> turn · <kbd>Shift</kbd> boost ·
+      <kbd>Space</kbd> stop</div>
     <div id="tooltip" hidden></div>
     <div id="overlay" hidden>
       <div class="loader">
@@ -201,6 +276,6 @@
     </div>
   </main>
 
-  <script type="module" src="src/main.js"></script>
+  <script type="module" src="./src/main.js"></script>
 </body>
 </html>
