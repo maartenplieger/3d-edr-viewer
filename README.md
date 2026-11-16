@@ -40,6 +40,18 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - **Grid cells.** *Appearance → Grid cells* draws the cells in use: their edges on the ground, and on the
   west and north walls a line per column and per loaded level (following the actual heights in pressure
   altitude mode). With a horizontal step these are the averaged cells, on a native grid the native cells.
+- **Sun.** *Appearance → Sun at the shown time* puts the sun where it is at the shown time, seen from the centre
+  of the data (on a rotated grid turned to grid north), from the Astronomical Almanac's low-precision formulas.
+  The light on isosurfaces and the volume then comes from the sun, the sky turns blue by day with a glow around
+  the sun and twilight colours when it is low, and the stars fade out. The HUD gives its elevation and azimuth;
+  it follows the time, also while animating.
+- **Globe.** *Globe* in the view bar wraps the scene around the Earth: every point goes to its real lon/lat on a
+  sphere with the Earth's radius, at its height (times the vertical scale). The centre of the data stays on top,
+  so the view starts like the flat one, only curved; zoom out to see the whole Earth. Slices, isosurfaces (with
+  their normals), streamlines, borders, grid cells, labels and the box are placed on the globe; the volume's
+  ray marching turns every sample back to the flat data. With *Earth surface* the whole globe gets a world base
+  map (the selected layer stays on the data area), with the night side darker when the sun is on. Far above the
+  Earth the sky fades to black space with stars all around. Changing the vertical scale rebuilds the geometry.
 - **Wind with streamlines.** When a collection has both wind speed and wind direction
   (`wind_speed…` and `wind_from_direction…`), the parameter list ends with *Wind: speed + direction, with
   streamlines*. It loads both: the speed is drawn as usual, and 4000 particles with fading trails move with the
@@ -149,6 +161,8 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - `src/streamlines.js` – particles with trails moving with the derived wind
 - `src/volume.js` – volume resampling, 3D texture and ray-marching shader
 - `src/rotpole.js` – rotated pole CRS from WKT, rotated ↔ lon/lat
+- `src/sun.js` – position of the sun at a time
+- `src/globe.js` – the globe projection: flat scene ↔ sphere
 - `src/colormaps.js` – colour maps, shader texture and colour bar
 - `src/main.js` – scene, UI wiring, slices, labels, picking
 - `public/favicon.svg` – the icon: the ADAGUC globe seen from space, with a data cube and a jet stream

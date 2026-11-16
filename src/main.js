@@ -7,6 +7,8 @@ import { COLORMAP_NAMES, makeColormapTexture, drawColorbar, hexToRgb } from './c
 import { resampleVolume, createVolumeMaterial, createVolumeTexture, updateVolumeCamera } from './volume.js';
 import { nativeCubeCrs, bboxToRot, bboxToGeo } from './rotpole.js';
 import { Streamlines } from './streamlines.js';
+import { sunPosition, enuFrame, dot } from './sun.js';
+import { makeGlobe, EARTH_RADIUS } from './globe.js';
 
 // No instance or time: runs expire on the server, so startup takes the latest run and its first time
 const DEFAULT_COLLECTION = 'https://geoservices.knmi.nl/edr/collections/uwcw-ha-det-dini-5p5km.ml';
@@ -140,7 +142,8 @@ camera.position.set(-150, -450, 300);
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 
-scene.add(new THREE.HemisphereLight(0xdde8ff, 0x2a3440, 1.4));
+const hemiLight = new THREE.HemisphereLight(0xdde8ff, 0x2a3440, 1.4);
+scene.add(hemiLight);
 
 // Optional sky as a reference while flying: a dome with a gradient towards the zenith, a faint line at the
 // true horizon, dark ground below it and stars above it. It moves with the camera, so it is infinitely far
@@ -148,10 +151,12 @@ scene.add(new THREE.HemisphereLight(0xdde8ff, 0x2a3440, 1.4));
 // behind everything else, and not affected by the depth haze.
 const skyGroup = new THREE.Group();
 skyGroup.visible = false;
+let skyDomeMaterial, starMaterial, lowerStarMaterial; // set below; the sun and the globe change them
 {
   const dome = new THREE.Mesh(
     new THREE.SphereGeometry(1, 64, 32),
-    new THREE.ShaderMaterial({
+    (skyDomeMaterial = new THREE.ShaderMaterial({
+      uniforms: { sunDir: { value: new THREE.Vector3(0, 0, -1) }, daylight: { value: 0 }, space: { value: 0 } },
       side: THREE.BackSide,
       depthWrite: false,
       depthTest: false,
@@ -162,18 +167,28 @@ skyGroup.visible = false;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
         }`,
       fragmentShader: /* glsl */ `
+        uniform vec3 sunDir; // towards the sun, z is up
+        uniform float daylight; // 0 at night (or without the sun), 1 with the sun well above the horizon
+        uniform float space; // 0 near the ground, 1 far above the globe: black space
         varying vec3 vDir;
         void main() {
-          float h = normalize(vDir).z; // sine of the elevation, z is up
-          vec3 zenith = vec3(0.012, 0.018, 0.040);
-          vec3 skyHorizon = vec3(0.150, 0.200, 0.270);
-          vec3 groundHorizon = vec3(0.105, 0.115, 0.125);
-          vec3 groundDeep = vec3(0.035, 0.040, 0.045);
+          vec3 dir = normalize(vDir);
+          float h = dir.z; // sine of the elevation, z is up
+          // Night colours, and day colours mixed in with the daylight
+          vec3 zenith = mix(vec3(0.012, 0.018, 0.040), vec3(0.10, 0.24, 0.50), daylight);
+          vec3 skyHorizon = mix(vec3(0.150, 0.200, 0.270), vec3(0.50, 0.63, 0.78), daylight);
+          vec3 groundHorizon = mix(vec3(0.105, 0.115, 0.125), vec3(0.30, 0.33, 0.36), daylight);
+          vec3 groundDeep = mix(vec3(0.035, 0.040, 0.045), vec3(0.12, 0.13, 0.14), daylight);
           vec3 c = h >= 0.0 ? mix(skyHorizon, zenith, pow(h, 0.4)) : mix(groundHorizon, groundDeep, pow(-h, 0.5));
           c += vec3(0.30, 0.36, 0.42) * exp(-abs(h) * 160.0) * 0.55; // the horizon line
-          gl_FragColor = vec4(c, 1.0);
+          // Glow around the sun, warmer and wider when it is low (twilight colours near the horizon)
+          float toSun = max(dot(dir, normalize(sunDir)), 0.0);
+          float low = 1.0 - smoothstep(0.0, 0.35, sunDir.z);
+          float near = smoothstep(-0.25, 0.05, sunDir.z); // no glow with the sun far below the horizon
+          c += near * (vec3(1.0, 0.85, 0.6) * pow(toSun, 24.0) * 0.6 + vec3(0.9, 0.45, 0.2) * low * pow(toSun, 4.0) * 0.35 * (1.0 - abs(h)));
+          gl_FragColor = vec4(mix(c, vec3(0.0), space), 1.0);
         }`,
-    }),
+    })),
   );
   dome.renderOrder = -20;
   dome.frustumCulled = false;
@@ -193,17 +208,56 @@ skyGroup.visible = false;
   const starGeom = new THREE.BufferGeometry();
   starGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   starGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  const stars = new THREE.Points(starGeom, new THREE.PointsMaterial({
-    size: 1.8, sizeAttenuation: false, vertexColors: true, depthWrite: false, depthTest: false, fog: false,
-  }));
+  const stars = new THREE.Points(starGeom, (starMaterial = new THREE.PointsMaterial({
+    size: 1.8, sizeAttenuation: false, vertexColors: true, depthWrite: false, depthTest: false, fog: false, transparent: true,
+  })));
   stars.renderOrder = -19;
   stars.frustumCulled = false;
-  skyGroup.add(dome, stars);
+  // The same stars mirrored below the horizon, only shown from space above the globe
+  const lowerPos = Float32Array.from(pos, (v, n) => (n % 3 === 2 ? -v : v));
+  const lowerGeom = new THREE.BufferGeometry();
+  lowerGeom.setAttribute('position', new THREE.BufferAttribute(lowerPos, 3));
+  lowerGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const lowerStars = new THREE.Points(lowerGeom, (lowerStarMaterial = new THREE.PointsMaterial({
+    size: 1.8, sizeAttenuation: false, vertexColors: true, depthWrite: false, depthTest: false, fog: false, transparent: true, opacity: 0,
+  })));
+  lowerStars.renderOrder = -19;
+  lowerStars.frustumCulled = false;
+  skyGroup.add(dome, stars, lowerStars);
 }
 scene.add(skyGroup);
 const sun = new THREE.DirectionalLight(0xffffff, 1.8);
 sun.position.set(-1, -1.5, 3);
 scene.add(sun);
+
+// The sun at the shown time (Appearance → Sun): a disc with a glow, infinitely far away like the sky, and the
+// light from its direction. Without it the light comes from a fixed direction, as before.
+const sunGroup = new THREE.Group();
+sunGroup.visible = false;
+{
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(255,255,245,1)');
+  g.addColorStop(0.12, 'rgba(255,248,220,1)');
+  g.addColorStop(0.2, 'rgba(255,220,150,0.55)');
+  g.addColorStop(0.45, 'rgba(255,190,110,0.15)');
+  g.addColorStop(1, 'rgba(255,170,90,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const disc = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, depthTest: false, depthWrite: false, fog: false, transparent: true, blending: THREE.AdditiveBlending,
+  }));
+  disc.renderOrder = -18; // after the sky and the stars, before everything else
+  disc.frustumCulled = false;
+  sunGroup.add(disc);
+}
+scene.add(sunGroup);
+const DEFAULT_LIGHT = new THREE.Vector3(-1, -1.5, 3);
+const sunState = { dir: null, elevation: null, azimuth: null };
 const fill = new THREE.DirectionalLight(0xffffff, 0.5);
 fill.position.set(1, 1.5, -1);
 scene.add(fill);
@@ -310,11 +364,7 @@ const tmpSphere = new THREE.Sphere();
 function updateHaze() {
   scene.fog = $('hazeOn').checked && state.geo ? haze : null;
   if (!scene.fog) return;
-  const { px, py, zmin, zmax } = state.geo;
-  const s = vscale();
-  tmpBox.min.set(px[0], py[0], zmin * s);
-  tmpBox.max.set(px.at(-1), py.at(-1), zmax * s);
-  tmpBox.getBoundingSphere(tmpSphere);
+  dataBounds(tmpBox).getBoundingSphere(tmpSphere);
   const d = camera.position.distanceTo(tmpSphere.center);
   const strength = Number($('hazeAmount').value);
   haze.near = Math.max(0, d - tmpSphere.radius);
@@ -367,11 +417,10 @@ controls.addEventListener('start', () => {
   stopFlight();
   attitude.bank = attitude.nose = 0;
   if (!wasFlying || !state.geo) return;
-  const { px, py, zmin, zmax, ext } = state.geo;
-  const s = vscale();
+  const { ext } = state.geo;
   const { dir, center } = handoverTmp;
   dir.subVectors(controls.target, camera.position).normalize();
-  center.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, ((zmin + zmax) / 2) * s);
+  dataBounds(tmpBox).getCenter(center);
   // Distance along the view to the point closest to the data centre; a fixed distance when the data is behind
   const along = center.sub(camera.position).dot(dir);
   const distance = along > ext * 0.02 ? along : ext * 0.3;
@@ -475,9 +524,14 @@ function updateFlightInfo(now) {
   flightInfoAt = now;
   const g = state.grid, { lon0, lat0, kx, ky, levelSpacing } = state.geo;
   const p = camera.position;
-  const x = lon0 + p.x / kx, y = lat0 + p.y / ky; // grid coordinates: lon/lat, or rotated on a native grid
-  const [lon, lat] = g.proj ? g.proj.toGeo(x, y) : [x, y];
-  const z = p.z / vscale();
+  let lon, lat, z;
+  if (globe) {
+    ({ lon, lat, height: z } = globe.unplace(p.x, p.y, p.z));
+  } else {
+    const x = lon0 + p.x / kx, y = lat0 + p.y / ky; // grid coordinates: lon/lat, or rotated on a native grid
+    [lon, lat] = g.proj ? g.proj.toGeo(x, y) : [x, y];
+    z = p.z / vscale();
+  }
   let height;
   if (g.vkind === 'pressure' || g.vkind === 'height' || (g.vmode === 'pressure' && g.data[g.pressureParam])) height = `${fmt(z / KM_SCALE, 2)} km`;
   else {
@@ -492,6 +546,40 @@ function updateFlightInfo(now) {
   const speed = Math.hypot(flight.forward, flight.side, flight.vertical); // scene units are km horizontally
   el.innerHTML = `${fmt(Math.abs(lat), 3)}°${lat >= 0 ? 'N' : 'S'} ${fmt(Math.abs(lon), 3)}°${lon >= 0 ? 'E' : 'W'} · ${height}<br>` +
     `speed <b>${fmt(speed, speed < 10 ? 2 : 1)} km/s</b> · heading ${fmt(heading, 0)}°${g.proj ? ' (grid)' : ''}`;
+}
+
+// On the globe the camera can go from near the data to far out in space: the far plane must stay beyond the
+// whole Earth, and the near plane grows with the distance so the depth buffer keeps its precision
+function fitClipPlanes() {
+  const toCentre = camera.position.distanceTo(skyTmp.centre.fromArray(globe.centre));
+  const far = toCentre + EARTH_RADIUS * 1.5;
+  const near = Math.max(1, Math.min(far / 2000, Math.max(toCentre - EARTH_RADIUS * 1.2, 0) * 0.02 + 2));
+  if (Math.abs(camera.far - far) > far * 0.01 || Math.abs(camera.near - near) > near * 0.05) {
+    camera.far = far;
+    camera.near = near;
+    camera.updateProjectionMatrix();
+  }
+}
+
+// On the globe the sky's horizon follows the local vertical at the camera, and fades to black space with stars all
+// around as the camera gets far above the Earth. Flat: the horizon is horizontal, as before.
+const skyTmp = { up: new THREE.Vector3(), z: new THREE.Vector3(0, 0, 1), q: new THREE.Quaternion(), sun: new THREE.Vector3(), centre: new THREE.Vector3() };
+function orientSky() {
+  const u = skyDomeMaterial.uniforms, daylight = u.daylight.value;
+  let space = 0;
+  if (globe) {
+    skyTmp.up.copy(camera.position).sub(new THREE.Vector3(...globe.centre));
+    const altitude = skyTmp.up.length() - EARTH_RADIUS;
+    space = THREE.MathUtils.smoothstep(altitude, EARTH_RADIUS * 0.05, EARTH_RADIUS * 0.6);
+    skyGroup.quaternion.setFromUnitVectors(skyTmp.z, skyTmp.up.normalize());
+  } else {
+    skyGroup.quaternion.identity();
+  }
+  u.space.value = space;
+  // The sun direction in the sky's own (rotated) coordinates
+  if (sunState.dir) u.sunDir.value.copy(sunState.dir).applyQuaternion(skyTmp.q.copy(skyGroup.quaternion).invert());
+  starMaterial.opacity = Math.max(1 - daylight, space);
+  lowerStarMaterial.opacity = space;
 }
 
 // Drawing only when something changes, so an idle view costs (almost) nothing. Things that change the scene
@@ -514,9 +602,15 @@ renderer.setAnimationLoop((now) => {
   const banking = Math.abs(attitude.bank) > 1e-5 || Math.abs(attitude.nose) > 1e-5;
   if (!(cameraMoved || flying || banking || streamlines.object.visible || pickPending || renderFrames > 0)) return;
   if (renderFrames > 0) renderFrames--;
+  if (globe) fitClipPlanes();
   if (skyGroup.visible) {
     skyGroup.position.copy(camera.position); // centred on the camera: infinitely far away
     skyGroup.scale.setScalar(camera.far * 0.9); // inside the far plane
+    orientSky();
+  }
+  if (sunGroup.visible) {
+    sunGroup.position.copy(camera.position);
+    sunGroup.scale.setScalar(camera.far * 0.85);
   }
   updateHaze();
   if (state.volume && volumeGroup.visible) updateVolumeCamera(state.volume.mesh, camera);
@@ -842,6 +936,7 @@ function fetchFrame({ opts, meta, key }, { signal, onProgress, onUrl, force = fa
 
 function showGrid(grid) {
   requestRender();
+  queueMicrotask(updateSun); // the sun follows the shown time
   // Keep the camera when only the time or parameter changed; fit it again for a new area, grid or levels
   const refit = !state.grid || viewKey(state.grid) !== viewKey(grid);
   state.grid = grid;
@@ -1079,7 +1174,68 @@ function computeGeo() {
   }
   let zmin = Infinity, zmax = -Infinity;
   for (const z of pz) { if (z < zmin) zmin = z; if (z > zmax) zmax = z; }
-  state.geo = { px, py, pz, lon0, lat0, kx, ky, ext, zmin, zmax, levelSpacing };
+  state.geo = { px, py, pz, lon0, lat0, kx, ky, ext, zmin, zmax, levelSpacing, frame: sceneFrame(g, lon0, lat0, kx, ky) };
+}
+
+// The scene's axes as Earth-fixed unit vectors, at the centre of the data: x and y along the grid (east and
+// north on a lon/lat grid; on a rotated pole grid turned to grid north), z up. Directions such as the sun's
+// are turned into the scene with it.
+function sceneFrame(g, lon0, lat0, kx, ky) {
+  const [lon, lat] = g.proj ? g.proj.toGeo(lon0, lat0) : [lon0, lat0];
+  let alpha = 0; // angle of true north from the scene's +y, clockwise
+  if (g.proj) {
+    const [x2, y2] = g.proj.toRot(lon, Math.min(89.9, lat + 0.05));
+    alpha = Math.atan2((x2 - lon0) * kx, (y2 - lat0) * ky);
+  }
+  const { east, north, up } = enuFrame(lon, lat);
+  const ca = Math.cos(alpha), sa = Math.sin(alpha);
+  const x = east.map((e, i) => ca * e + sa * north[i]);
+  const y = east.map((e, i) => -sa * e + ca * north[i]);
+  return { lon, lat, x, y, up };
+}
+
+// Sun at the shown time: its direction in the scene (towards the sun), the light, the sky's daylight and the disc
+function updateSun() {
+  const on = $('sunOn').checked && state.grid && state.geo;
+  sunGroup.visible = !!on;
+  if (!on) {
+    sunState.dir = null;
+    sun.position.copy(DEFAULT_LIGHT);
+    sun.intensity = 1.8;
+    hemiLight.intensity = 1.4;
+    volumeUniforms.lightDir.value.set(-0.4, -0.6, 1.0).normalize();
+    skyDomeMaterial.uniforms.daylight.value = 0;
+    skyDomeMaterial.uniforms.sunDir.value.set(0, 0, -1);
+    starMaterial.opacity = 1;
+    globeEarthUniforms.sunOn.value = 0;
+    requestRender();
+    updateHud();
+    return;
+  }
+  const { frame } = state.geo;
+  const s = sunPosition(state.grid.datetime || Date.now()).ecef;
+  const dir = new THREE.Vector3(dot(frame.x, s), dot(frame.y, s), dot(frame.up, s)).normalize();
+  sunState.dir = dir;
+  sunState.elevation = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(dir.z, -1, 1)));
+  const enu = enuFrame(frame.lon, frame.lat); // azimuth from true north, also on a rotated grid
+  sunState.azimuth = (THREE.MathUtils.radToDeg(Math.atan2(dot(enu.east, s), dot(enu.north, s))) + 360) % 360;
+  // Daylight from just below the horizon (twilight) to well above it
+  const daylight = THREE.MathUtils.smoothstep(dir.z, -0.1, 0.25);
+  sun.position.copy(dir);
+  sun.intensity = 0.25 + 1.9 * THREE.MathUtils.smoothstep(dir.z, -0.05, 0.3);
+  hemiLight.intensity = 0.7 + 0.7 * daylight;
+  volumeUniforms.lightDir.value.copy(dir.z > -0.1 ? dir : DEFAULT_LIGHT).normalize();
+  skyDomeMaterial.uniforms.daylight.value = daylight;
+  skyDomeMaterial.uniforms.sunDir.value.copy(dir);
+  starMaterial.opacity = 1 - daylight;
+  globeEarthUniforms.sunDir.value.copy(dir);
+  globeEarthUniforms.sunOn.value = 1;
+  const disc = sunGroup.children[0];
+  disc.position.copy(dir).multiplyScalar(0.97);
+  disc.scale.setScalar(0.11);
+  disc.visible = dir.z > -0.08; // set below the horizon
+  requestRender();
+  updateHud();
 }
 
 function dataRange() {
@@ -1089,8 +1245,65 @@ function dataRange() {
   return [lo, hi];
 }
 
+// Globe projection (Globe in the view bar): while it is on, every builder places its points through the globe
+// mapper, which wraps the flat scene around the Earth (see globe.js). The vertical scale is then part of that
+// placement instead of the scale of dataGroup, so changing it rebuilds the geometry. Off: flat, as before.
+let globe = null;
+function updateGlobeMapper() {
+  globe = $('globeOn').checked && state.grid && state.geo ? makeGlobe(state.geo, state.grid.proj, vscale()) : null;
+  dataGroup.scale.set(1, 1, globe ? 1 : vscale());
+  state.geo && (state.geo.globeBounds = globe ? globeBounds() : null);
+}
+
+// A flat scene point (z unscaled) in dataGroup coordinates: on the globe, or as it is
+const placePoint = (x, y, z) => (globe ? globe.place(x, y, z) : [x, y, z]);
+
+// Places an array of flat xyz triples in place (globe mode only)
+function placeAll(arr) {
+  if (!globe) return arr;
+  const out = [];
+  for (let n = 0; n < arr.length; n += 3) {
+    globe.place(arr[n], arr[n + 1], arr[n + 2], out);
+    arr[n] = out[0]; arr[n + 1] = out[1]; arr[n + 2] = out[2];
+  }
+  return arr;
+}
+
+// A straight flat segment as `pieces` segments, so it follows the curvature on the globe
+function pushSegment(pts, x0, y0, z0, x1, y1, z1, pieces) {
+  const n = globe ? pieces : 1;
+  for (let i = 0; i < n; i++) {
+    const a = i / n, b = (i + 1) / n;
+    pts.push(x0 + (x1 - x0) * a, y0 + (y1 - y0) * a, z0 + (z1 - z0) * a, x0 + (x1 - x0) * b, y0 + (y1 - y0) * b, z0 + (z1 - z0) * b);
+  }
+}
+
+// Bounding box of the data on the globe (dataGroup = world coordinates there), from points on its outside
+function globeBounds() {
+  const { px, py, zmin, zmax } = state.geo;
+  const box = new THREE.Box3(), v = new THREE.Vector3();
+  for (let a = 0; a <= 16; a++) {
+    for (let b = 0; b <= 16; b++) {
+      const x = px[0] + ((px.at(-1) - px[0]) * a) / 16, y = py[0] + ((py.at(-1) - py[0]) * b) / 16;
+      for (const z of [zmin, zmax]) box.expandByPoint(v.fromArray(globe.place(x, y, z)));
+    }
+  }
+  return box;
+}
+
+// Bounding box of the data in world coordinates, flat or on the globe
+function dataBounds(out = new THREE.Box3()) {
+  if (state.geo.globeBounds) return out.copy(state.geo.globeBounds);
+  const { px, py, zmin, zmax } = state.geo;
+  const s = vscale();
+  out.min.set(px[0], py[0], zmin * s);
+  out.max.set(px.at(-1), py.at(-1), zmax * s);
+  return out;
+}
+
 function rebuildAll() {
   computeGeo();
+  updateGlobeMapper();
   const g = state.grid;
   const [lo, hi] = dataRange();
   g.min = lo;
@@ -1138,8 +1351,32 @@ function buildVolume() {
   volumeUniforms.vol.value = tex;
   volumeUniforms.texSize.value.set(g.nx, g.ny, vol.depth);
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), volumeMaterial);
-  mesh.scale.set(px.at(-1) - px[0], py.at(-1) - py[0], zmax - zmin);
-  mesh.position.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, (zmin + zmax) / 2);
+  const wantGlobe = !!globe;
+  if (!!volumeMaterial.defines.GLOBE !== wantGlobe) {
+    if (wantGlobe) volumeMaterial.defines.GLOBE = ''; else delete volumeMaterial.defines.GLOBE;
+    volumeMaterial.needsUpdate = true;
+  }
+  if (globe) {
+    // The box is the bounding box of the curved data; the shader turns every sample back to the flat texture
+    const b = state.geo.globeBounds, size = b.getSize(new THREE.Vector3());
+    mesh.scale.copy(size);
+    b.getCenter(mesh.position);
+    const u = volumeUniforms, { frame, lon0, lat0, kx, ky } = state.geo;
+    u.gBoxMin.value.copy(b.min);
+    u.gBoxSize.value.copy(size);
+    u.gFx.value.fromArray(frame.x); u.gFy.value.fromArray(frame.y); u.gUp.value.fromArray(frame.up);
+    u.gR.value = EARTH_RADIUS;
+    u.gVscale.value = globe.vscale;
+    u.gGrid0.value.set(lon0, lat0);
+    u.gK.value.set(kx, ky);
+    u.gFlat0.value.set(px[0], py[0], zmin);
+    u.gFlatSize.value.set(px.at(-1) - px[0], py.at(-1) - py[0], zmax - zmin);
+    u.gRotated.value = g.proj ? 1 : 0;
+    if (g.proj) u.gPole.value.set(g.proj.lon0, g.proj.oLatP);
+  } else {
+    mesh.scale.set(px.at(-1) - px[0], py.at(-1) - py[0], zmax - zmin);
+    mesh.position.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, (zmin + zmax) / 2);
+  }
   mesh.renderOrder = 10;
   mesh.frustumCulled = false;
   volumeGroup.add(mesh);
@@ -1238,7 +1475,10 @@ function buildStreamlines() {
     if (style === 1) return s <= t;
     return vis.slice(0, MAX_ISO_LINES).some((iso) => Math.abs(s - iso.value) <= 1.5 * width);
   };
-  streamlines.setField({ nx, ny, nz, u: streamWind.u, v: streamWind.v, speed, px, py, pz, seedable, crossTime: STREAM_CROSS_TIME });
+  streamlines.setField({
+    nx, ny, nz, u: streamWind.u, v: streamWind.v, speed, px, py, pz, seedable, crossTime: STREAM_CROSS_TIME,
+    place: globe ? (x, y, z) => globe.place(x, y, z) : null, // on the globe the trails are placed there
+  });
 }
 const DEG = Math.PI / 180;
 
@@ -1257,8 +1497,8 @@ function buildGridCells() {
   const x0 = px[0], x1 = px.at(-1), y0 = py[0], y1 = py.at(-1);
   const zg = zmin - ext * 0.0022; // just above the base map, below the borders
   const pts = [];
-  for (const x of ex) pts.push(x, y0, zg, x, y1, zg);
-  for (const y of ey) pts.push(x0, y, zg, x1, y, zg);
+  for (const x of ex) pushSegment(pts, x, y0, zg, x, y1, zg, ny);
+  for (const y of ey) pushSegment(pts, x0, y, zg, x1, y, zg, nx);
   // Walls: west (x = x0) and north (y = y1), where the level labels are
   for (const x of ex) pts.push(x, y1, zmin, x, y1, zmax);
   for (const y of ey) pts.push(x0, y, zmin, x0, y, zmax);
@@ -1273,7 +1513,7 @@ function buildGridCells() {
     }
   }
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(placeAll(pts), 3));
   const mat = new THREE.LineBasicMaterial({ color: 0x9fb4c8, transparent: true, opacity: 0.18, depthWrite: false });
   gridGroup.add(new THREE.LineSegments(geom, mat));
 }
@@ -1281,9 +1521,21 @@ function buildGridCells() {
 function buildBox() {
   disposeChildren(boxGroup);
   const { px, py, zmin, zmax } = state.geo;
-  const box = new THREE.Box3(new THREE.Vector3(px[0], py[0], zmin), new THREE.Vector3(px.at(-1), py.at(-1), zmax));
-  const helper = new THREE.Box3Helper(box, 0x4a5868);
-  boxGroup.add(helper);
+  if (globe) {
+    // The 12 edges, curved along the globe
+    const x = [px[0], px.at(-1)], y = [py[0], py.at(-1)], z = [zmin, zmax], pts = [];
+    for (const zz of z) {
+      for (const yy of y) pushSegment(pts, x[0], yy, zz, x[1], yy, zz, 64);
+      for (const xx of x) pushSegment(pts, xx, y[0], zz, xx, y[1], zz, 64);
+    }
+    for (const xx of x) for (const yy of y) pushSegment(pts, xx, yy, z[0], xx, yy, z[1], 1);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(placeAll(pts), 3));
+    boxGroup.add(new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0x4a5868 })));
+  } else {
+    const box = new THREE.Box3(new THREE.Vector3(px[0], py[0], zmin), new THREE.Vector3(px.at(-1), py.at(-1), zmax));
+    boxGroup.add(new THREE.Box3Helper(box, 0x4a5868));
+  }
   boxGroup.visible = $('boxOn').checked;
 }
 
@@ -1330,7 +1582,7 @@ function buildBorders() {
       }
     }
     const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(placeAll(pts), 3));
     mapGroup.add(new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0xc8d3de })));
   }
   mapGroup.visible = $('bordersOn').checked;
@@ -1371,8 +1623,19 @@ function buildGround() {
   const mat = new THREE.MeshBasicMaterial({
     color: 0x18212b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
   });
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
-  ground.position.set((px[0] + px.at(-1)) / 2, (py[0] + py.at(-1)) / 2, zmin - ext * 0.003);
+  const cx = (px[0] + px.at(-1)) / 2, cy = (py[0] + py.at(-1)) / 2, zg = zmin - ext * 0.003;
+  const plane = globe ? new THREE.PlaneGeometry(w, h, 96, 96) : new THREE.PlaneGeometry(w, h);
+  if (globe) {
+    // Each vertex to its place on the globe (the plane's own coordinates are relative to the centre of the data)
+    const pos = plane.attributes.position, out = [];
+    for (let n = 0; n < pos.count; n++) {
+      globe.place(cx + pos.getX(n), cy + pos.getY(n), zg, out);
+      pos.setXYZ(n, out[0], out[1], out[2]);
+    }
+    plane.computeBoundingSphere();
+  }
+  const ground = new THREE.Mesh(plane, mat);
+  if (!globe) ground.position.set(cx, cy, zg);
   groundGroup.add(ground);
 
   const layer = $('baseLayer').value;
@@ -1400,6 +1663,10 @@ function buildEarth() {
   disposeChildren(earthGroup);
   earthGroup.visible = $('earthOn').checked;
   if (!state.grid || !earthGroup.visible) return;
+  if (globe) {
+    buildGlobeEarth();
+    return;
+  }
   const { lons, lats, proj } = state.grid;
   const { lon0, lat0, kx, ky, zmin, ext } = state.geo;
   const half = (EARTH_SIZE - 1) / 2;
@@ -1439,6 +1706,75 @@ function buildEarth() {
     if (!tex || earth.parent !== earthGroup) return;
     mat.map = tex;
     mat.color.setScalar(Number($('mapBrightness').value) * EARTH_BRIGHTNESS);
+    mat.needsUpdate = true;
+    requestRender();
+  });
+}
+
+// The whole Earth in globe mode: a lon/lat grid on the sphere, just below the map under the data, with the
+// base map of the whole world (CRS:84) and faint degree lines. With the sun on, the night side is darker.
+const globeEarthUniforms = { sunDir: { value: new THREE.Vector3(0, 0, 1) }, sunOn: { value: 0 } };
+const GLOBE_LAYER = 'countryfilled'; // a base layer of the whole world
+function buildGlobeEarth() {
+  const { zmin, ext } = state.geo;
+  const h = (zmin - ext * 0.006) * globe.vscale; // below the map under the data
+  const NLON = 256, NLAT = 128;
+  const pos = new Float32Array((NLON + 1) * (NLAT + 1) * 3), uv = new Float32Array((NLON + 1) * (NLAT + 1) * 2), out = [];
+  for (let j = 0; j <= NLAT; j++) {
+    for (let i = 0; i <= NLON; i++) {
+      const lon = -180 + (360 * i) / NLON, lat = -90 + (180 * j) / NLAT, n = j * (NLON + 1) + i;
+      globe.placeLonLat(lon, lat, h, out);
+      pos.set(out, n * 3);
+      uv.set([i / NLON, j / NLAT], n * 2);
+    }
+  }
+  const index = [];
+  for (let j = 0; j < NLAT; j++) {
+    for (let i = 0; i < NLON; i++) {
+      const a = j * (NLON + 1) + i, b = a + 1, c = a + NLON + 1, d = c + 1;
+      index.push(a, b, d, a, d, c);
+    }
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  geom.setIndex(index);
+  const mat = new THREE.MeshBasicMaterial({ color: 0x10161c, fog: false, polygonOffset: true, polygonOffsetFactor: 4, polygonOffsetUnits: 4 });
+  // Night side darker when the sun is on: the light from the direction of the sun on the radial normal
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.sunDir = globeEarthUniforms.sunDir;
+    shader.uniforms.sunOn = globeEarthUniforms.sunOn;
+    shader.uniforms.globeCentre = { value: new THREE.Vector3(...globe.centre) };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 globeCentre;\nvarying vec3 vRadial;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvRadial = position - globeCentre;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 sunDir;\nuniform float sunOn;\nvarying vec3 vRadial;')
+      .replace('#include <map_fragment>', `#include <map_fragment>
+        if (sunOn > 0.5) diffuseColor.rgb *= mix(0.25, 1.0, smoothstep(-0.08, 0.12, dot(normalize(vRadial), normalize(sunDir))));`);
+  };
+  mat.customProgramCacheKey = () => 'globe-earth';
+  const earth = new THREE.Mesh(geom, mat);
+  earth.frustumCulled = false;
+  earthGroup.add(earth);
+
+  // Degree lines every 15°
+  const pts = [];
+  for (let lon = -180; lon < 180; lon += 15) for (let lat = -90; lat < 90; lat += 2) pts.push(...globe.placeLonLat(lon, lat, h), ...globe.placeLonLat(lon, lat + 2, h));
+  for (let lat = -75; lat <= 75; lat += 15) for (let lon = -180; lon < 180; lon += 2) pts.push(...globe.placeLonLat(lon, lat, h), ...globe.placeLonLat(lon + 2, lat, h));
+  const lineGeom = new THREE.BufferGeometry();
+  lineGeom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  earthGroup.add(new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: 0x8fa3b8, transparent: true, opacity: 0.12, depthWrite: false, fog: false })));
+
+  // The selected base layer may cover only Europe (empty elsewhere): the globe uses a world layer, and the map
+  // under the data keeps the selected one
+  if (!$('baseLayer').value) return;
+  const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${GLOBE_LAYER}&STYLES=` +
+    '&CRS=CRS:84&BBOX=-180,-90,180,90&WIDTH=4096&HEIGHT=2048&FORMAT=image/png&TRANSPARENT=FALSE';
+  getMapTexture(url, 'globe').then((tex) => {
+    if (!tex || earth.parent !== earthGroup) return;
+    mat.map = tex;
+    mat.color.setScalar(Number($('mapBrightness').value) * 0.35); // darker than the data area, which stays on top
     mat.needsUpdate = true;
     requestRender();
   });
@@ -1500,7 +1836,7 @@ function sliceGeometry(nu, nv, mapper) {
     for (let u = 0; u < nu; u++) {
       const [i, j, k] = mapper(u, v);
       const n = v * nu + u, p = (k * ny + j) * nx + i;
-      pos.set([px[i], py[j], pz[p]], n * 3);
+      pos.set(placePoint(px[i], py[j], pz[p]), n * 3);
       ijk.set([i, j, k], n * 3);
       val[n] = field[p] === field[p] ? field[p] : -1e30;
     }
@@ -1724,6 +2060,15 @@ function showIsoResult(iso, r, ms) {
   const tris = r.indices.length / 3;
   iso.el.info.textContent = tris ? `${tris.toLocaleString()} triangles · ${ms.toFixed(0)} ms` : 'value not crossed in this cube';
   if (!tris) return;
+  if (globe) {
+    // Normals first: they are turned at the flat position of their vertex
+    const P = r.positions, N = r.normals, out = [];
+    for (let n = 0; n < P.length; n += 3) {
+      globe.mapNormal(P[n], P[n + 1], P[n + 2], N[n], N[n + 1], N[n + 2], out);
+      N[n] = out[0]; N[n + 1] = out[1]; N[n + 2] = out[2];
+    }
+    placeAll(P);
+  }
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
   geom.setAttribute('ijk', new THREE.BufferAttribute(r.ijk, 3));
@@ -1825,7 +2170,8 @@ function buildLabels() {
   const s = vscale(), h = ext * 0.028, z0 = zmin * s, pad = ext * 0.04;
   const add = (text, x, y, z) => {
     const l = makeLabel(text, h);
-    l.position.set(x, y, z);
+    if (globe) l.position.fromArray(globe.place(x, y, z / s)); // z comes scaled; the globe scales it itself
+    else l.position.set(x, y, z);
     labelGroup.add(l);
   };
   const lonStep = niceStep(lons.at(-1) - lons[0], 6);
@@ -1861,10 +2207,17 @@ function buildLabels() {
   }
 }
 
+let globeRebuildTimer = 0;
 function applyVScale() {
   const s = vscale();
-  dataGroup.scale.z = s;
   $('vscale').nextElementSibling.textContent = `×${s.toFixed(s < 1 ? 2 : 1)}`;
+  if (globe && globe.vscale !== s) {
+    // On the globe the vertical scale is part of every placed point: rebuild once the slider settles
+    clearTimeout(globeRebuildTimer);
+    globeRebuildTimer = setTimeout(() => state.grid && rebuildAll(), 150);
+  } else if (!globe) {
+    dataGroup.scale.z = s;
+  }
   buildLabels();
   syncViewControls();
 }
@@ -1873,13 +2226,23 @@ function fitCamera() {
   stopFlight(); // a new view starts at rest
   attitude.bank = attitude.nose = 0;
   if (!state.geo) return;
-  const { ext, zmin, zmax } = state.geo;
-  const s = vscale(), zmid = ((zmin + zmax) / 2) * s;
-  const d = Math.max(ext, (zmax - zmin) * s) * 1.5;
-  controls.target.set(0, 0, zmid);
-  camera.position.set(-d * 0.35, -d * 0.95, zmid + d * 0.55);
-  camera.near = d / 500;
-  camera.far = d * 20;
+  if (globe) {
+    // Around the curved data, with the far plane beyond the whole Earth
+    const sphere = dataBounds(tmpBox).getBoundingSphere(tmpSphere);
+    const d = sphere.radius * 2.2;
+    controls.target.copy(sphere.center);
+    camera.position.set(sphere.center.x - d * 0.35, sphere.center.y - d * 0.95, sphere.center.z + d * 0.55);
+    camera.near = d / 500;
+    camera.far = Math.max(d * 20, EARTH_RADIUS * 12);
+  } else {
+    const { ext, zmin, zmax } = state.geo;
+    const s = vscale(), zmid = ((zmin + zmax) / 2) * s;
+    const d = Math.max(ext, (zmax - zmin) * s) * 1.5;
+    controls.target.set(0, 0, zmid);
+    camera.position.set(-d * 0.35, -d * 0.95, zmid + d * 0.55);
+    camera.near = d / 500;
+    camera.far = d * 20;
+  }
   camera.updateProjectionMatrix();
   controls.update();
 }
@@ -1949,7 +2312,8 @@ function updateHud() {
     `read ${fmtCount(g.valuesRead)} values (${g.sourceSize.join('×')} × ${g.nz} levels${Object.keys(g.data).length > 1 ? ` × ${Object.keys(g.data).length} parameters` : ''})` +
     `${g.valuesMissing ? `, ${fmtCount(g.valuesMissing)} without data` : ''}` +
     `${g.stride > 1 ? ` · shown as ${fmtCount(g.nx * g.ny * g.nz)} points (${g.stride}×${g.stride} averaged)` : ''}<br>` +
-    `range ${fmt(g.min)} … ${fmt(g.max)} ${g.unit}` + (isoTxt ? `<br>isosurface ${isoTxt}` : '');
+    `range ${fmt(g.min)} … ${fmt(g.max)} ${g.unit}` + (isoTxt ? `<br>isosurface ${isoTxt}` : '') +
+    (sunState.dir ? `<br>sun ${sunState.elevation >= 0 ? `${fmt(sunState.elevation, 0)}° above` : `${fmt(-sunState.elevation, 0)}° below`} the horizon, azimuth ${fmt(sunState.azimuth, 0)}°` : '');
 }
 
 // ---------------------------------------------------------------- picking
@@ -2084,6 +2448,7 @@ async function applyPreset(p) {
   $('serverResolution').value = p.resolution ? p.resolution.join('x') : ''; // presets without it use the server's grid
   if (p.gridCells != null) $('gridOn').checked = p.gridCells; // drawn when the data is shown
   if (p.earth != null) $('earthOn').checked = p.earth;
+  if (p.globe != null) $('globeOn').checked = p.globe;
   if (p.sky != null) {
     $('skyOn').checked = p.sky;
     skyGroup.visible = p.sky;
@@ -2345,6 +2710,12 @@ $('mapBrightness').addEventListener('input', () => {
 });
 $('gridOn').addEventListener('change', buildGridCells);
 $('skyOn').addEventListener('change', () => (skyGroup.visible = $('skyOn').checked));
+$('sunOn').addEventListener('change', updateSun);
+$('globeOn').addEventListener('change', () => {
+  if (!state.grid) return;
+  rebuildAll();
+  fitCamera(); // the view around the data, flat or curved
+});
 
 // Collapsible panel, remembered in this browser (storage may be unavailable, e.g. in a private window)
 function setPanelHidden(hidden) {

@@ -63,6 +63,22 @@ export function createVolumeMaterial(shared) {
     cmin: { value: 0 }, // colour-map range of the volume
     cmax: { value: 1 },
     localToView: { value: new THREE.Matrix4() },
+    lightDir: { value: new THREE.Vector3(-0.4, -0.6, 1.0).normalize() }, // in box space; the sun sets it
+    // Globe projection (define GLOBE): the box is the bounding box of the curved data; every sample is turned back
+    // from the globe to the flat scene, and from there to texture coordinates. See globe.js.
+    gBoxMin: { value: new THREE.Vector3() },
+    gBoxSize: { value: new THREE.Vector3(1, 1, 1) },
+    gFx: { value: new THREE.Vector3(1, 0, 0) },
+    gFy: { value: new THREE.Vector3(0, 1, 0) },
+    gUp: { value: new THREE.Vector3(0, 0, 1) },
+    gR: { value: 6371 },
+    gVscale: { value: 1 },
+    gGrid0: { value: new THREE.Vector2() }, // grid coordinates of the scene origin (lon0, lat0)
+    gK: { value: new THREE.Vector2(1, 1) }, // km per degree (kx, ky)
+    gFlat0: { value: new THREE.Vector3() }, // flat scene x, y, z at texture coordinate 0
+    gFlatSize: { value: new THREE.Vector3(1, 1, 1) }, // flat scene size of the texture
+    gRotated: { value: 0 }, // 1 on a rotated pole grid
+    gPole: { value: new THREE.Vector2() }, // lon_0 and o_lat_p of the rotated pole
     ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
   };
   return new THREE.ShaderMaterial({
@@ -90,6 +106,32 @@ export function createVolumeMaterial(shared) {
       uniform float isoValues[4];
       uniform vec3 isoColors[4];
       uniform mat4 localToView;
+      uniform vec3 lightDir;
+      #ifdef GLOBE
+        uniform vec3 gBoxMin, gBoxSize, gFx, gFy, gUp, gFlat0, gFlatSize;
+        uniform vec2 gGrid0, gK, gPole;
+        uniform float gR, gVscale, gRotated;
+        // Point in the box (0..1) → texture coordinates, or outside 0..1 when the point is not in the data
+        vec3 globeToTex(vec3 p) {
+          vec3 w = gBoxMin + p * gBoxSize; // globe scene point
+          vec3 e = w.x * gFx + w.y * gFy + (w.z + gR) * gUp; // Earth-fixed, km
+          float r = length(e);
+          float lat = asin(clamp(e.z / r, -1.0, 1.0)), lon = atan(e.y, e.x); // radians
+          vec2 g;
+          if (gRotated > 0.5) {
+            // lon/lat → rotated lon/lat, as rotpole.js toRot
+            float t = radians(90.0 - gPole.y), dl = lon - radians(gPole.x);
+            float sl = sin(lat), cl = cos(lat);
+            float y = asin(clamp(cos(t) * sl - sin(t) * cl * cos(dl), -1.0, 1.0));
+            float x = atan(cl * sin(dl), cos(t) * cl * cos(dl) + sin(t) * sl);
+            g = degrees(vec2(x, y));
+          } else {
+            g = degrees(vec2(lon, lat));
+          }
+          vec3 flatPoint = vec3((g - gGrid0) * gK, (r - gR) / gVscale);
+          return (flatPoint - gFlat0) / gFlatSize;
+        }
+      #endif
       varying vec3 vOrigin;
       varying vec3 vDirection;
       #ifdef USE_FOG
@@ -142,12 +184,17 @@ export function createVolumeMaterial(shared) {
         b.x = max(b.x, 0.0);
         float dt = 1.7320508 / steps;
         float t = b.x + dt * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
-        vec3 light = normalize(vec3(-0.4, -0.6, 1.0));
+        vec3 light = normalize(lightDir);
         vec3 g = 1.0 / texSize;
         vec4 acc = vec4(0.0);
         for (int n = 0; n < 2048; n++) {
           if (t > b.y) break;
           vec3 p = vOrigin + d * t + 0.5;
+          #ifdef GLOBE
+            vec3 pb = p; // the box position, for the haze depth
+            p = globeToTex(pb);
+            if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(1.0)))) { t += dt; continue; }
+          #endif
           float valid;
           float v = sampleVol(p, valid);
           if (valid > 0.5) {
@@ -163,7 +210,11 @@ export function createVolumeMaterial(shared) {
               col *= shade;
               #ifdef USE_FOG
                 // Depth haze per sample, at that sample's own view depth.
-                float depth = -(localToView * vec4(p - 0.5, 1.0)).z;
+                #ifdef GLOBE
+                  float depth = -(localToView * vec4(pb - 0.5, 1.0)).z;
+                #else
+                  float depth = -(localToView * vec4(p - 0.5, 1.0)).z;
+                #endif
                 col = mix(col, pow(fogColor, vec3(1.0 / 2.2)), smoothstep(fogNear, fogFar, depth));
               #endif
               acc.rgb += (1.0 - acc.a) * alpha * col;

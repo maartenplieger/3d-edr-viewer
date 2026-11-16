@@ -207,6 +207,7 @@
         <label class="check"><input id="labelsOn" type="checkbox" checked> Labels</label>
       </div>
       <label class="check" title="A reference while flying: sky, horizon and stars, infinitely far away"><input id="skyOn" type="checkbox"> Sky with horizon and stars</label>
+      <label class="check" title="The sun where it is at the shown time, seen from the centre of the data: its light, and daylight in the sky"><input id="sunOn" type="checkbox"> Sun at the shown time</label>
       <label class="check" title="The base map continued around the data (about 7× the area) with degree lines"><input id="earthOn" type="checkbox"> Earth surface around the data</label>
       <label class="check"><input id="hazeOn" type="checkbox" checked> Depth haze (fade distant data)</label>
       <label class="slider">Haze amount <input id="hazeAmount" type="range" min="0.05" max="1" step="0.05" value="0.4"><output></output></label>
@@ -263,6 +264,9 @@
           <option value="vol-2">Volume – band around</option>
           <option value="iso">Isosurface</option>
         </select>
+      </label>
+      <label class="vc-check" title="Wrap the scene around the Earth: the data at its real place and curvature on a globe">
+        <span class="vc-inline"><input id="globeOn" type="checkbox"> Globe</span>
       </label>
       <label id="vcStreamWrap" class="vc-check" title="Particles moving with the wind, inside the volume" hidden>
         <span class="vc-inline"><input id="vcStream" type="checkbox" checked> Streamlines</span>

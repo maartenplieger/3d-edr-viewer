@@ -37,7 +37,7 @@ export class Streamlines {
   }
 
   /**
-   * field: { nx, ny, nz, u, v, speed, px, py, pz, seedable(n) → bool, crossTime }
+   * field: { nx, ny, nz, u, v, speed, px, py, pz, seedable(n) → bool, crossTime, place(x, y, z) → [x, y, z] or null }
    * u, v: wind per grid point in scene directions (same unit as speed); px, py: scene x/y of columns and rows;
    * pz: scene z per grid point; seedable: whether particles may live at grid point n (e.g. inside the volume).
    * The fastest wind (99th percentile) crosses the area in crossTime seconds.
@@ -107,7 +107,8 @@ export class Streamlines {
 
   scenePosition(i, j, k) {
     const f = this.field;
-    return [f.px[0] + i * this.cellX, f.py[0] + j * this.cellY, this.sample(f.pz, i, j, k)];
+    const x = f.px[0] + i * this.cellX, y = f.py[0] + j * this.cellY, z = this.sample(f.pz, i, j, k);
+    return f.place ? f.place(x, y, z) : [x, y, z]; // place: e.g. onto the globe
   }
 
   update(dt) {
