@@ -81,12 +81,14 @@ export const bboxToRot = (proj, bbox) => transformBBox(proj.toRot, bbox);
 // Lon/lat bbox [W, S, E, N] that covers a rotated bbox.
 export const bboxToGeo = (proj, bbox) => transformBBox(proj.toGeo, bbox);
 
-// The rotated pole CRS that a collection offers for cube requests, as { crs, proj } or null.
+// The rotated pole CRS that a collection offers for cube requests, as { crs, proj, bbox, size, cellsize } or null.
+// bbox (outer cell edges), size (cells in x and y) and cellsize are the native grid, when the server gives them
+// (adaguc-server does in crs_details); they let a client ask for fewer cells with resolution-x/-y.
 export function nativeCubeCrs(collection) {
   const details = collection?.data_queries?.cube?.link?.variables?.crs_details || [];
   for (const d of details) {
     const proj = parseRotatedPoleWkt(d.wkt);
-    if (proj) return { crs: d.crs, proj };
+    if (proj) return { crs: d.crs, proj, bbox: d.bbox, size: d.size, cellsize: d.cellsize };
   }
   return null;
 }

@@ -24,9 +24,10 @@ npm run preview   # serve dist/ at http://localhost:8765 to check the build
 topojson-client come from npm (`package.json`); the coastline/border data and the base maps are fetched at
 run time.
 
-On startup it applies the first preset, *Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)*: KNMI UWCW HARMONIE model-level wind
-speed for the latest run over the full model domain (every 4th level from level 4, 4×4 averaged), as a volume filled
-above 50 kt with vertical scale ×10. To use other data, enter an EDR
+On startup it applies the first preset, *Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)*: KNMI
+UWCW HARMONIE model-level wind speed for the latest run over the full model domain on its native rotated pole
+grid (every 4th level from level 4, 4×4 averaged), as a volume filled above 50 kt with vertical scale ×10. To
+use other data, enter an EDR
 endpoint (e.g. `https://geoservices.knmi.nl/edr`) or a collection URL (`…/edr/collections/{id}`) at the top of
 the **Data** panel and press Enter or *Open*. An endpoint lists all its collections with at least two levels
 (and a cube query) under *Collection*, and opens the first; pick another there. A complete cube URL can still
@@ -68,7 +69,8 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   volume's fill threshold) with the volume density below it, how it is shown (volume filled above, below or in a band around the threshold, or
   an isosurface) and the vertical scale. They drive the same controls as the panel and stay in sync with it.
 - **Animation.** ▶ next to the time steps through all times of the run and wraps around; the menu next to it
-  sets the time per frame. While one time is shown, the next is loaded. Every loaded cube stays in memory
+  sets the time per frame, and *ahead* how many next times are loaded while one is shown (1–3, default 2:
+  more keeps the server busy, which matters when every new time takes seconds). Every loaded cube stays in memory
   (up to 1 GB, oldest used dropped first), so a second loop, or going back to a time, needs no request. The
   *Load* button always fetches from the server again. A manual load or time change stops the animation.
 - **Flying.** Fly through the scene with the keyboard, like a plane with inertia. <kbd>W</kbd>/<kbd>S</kbd>
@@ -87,9 +89,9 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - **Presets.** The *Presets* section applies a complete view in one click; the first one is also the start
   view. Presets are defined in the `PRESETS` list in `src/main.js`.
   - *Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)*: KNMI UWCW HARMONIE DINI from
-    `geoservices.knmi.nl`, wind speed on the full model domain, every 4th model level from level 4 (8 levels
-    per request), 4×4 averaged, as a
-    volume filled above 50 kt with vertical scale ×10, with the sky and the earth surface on.
+    `geoservices.knmi.nl`, on the model's native rotated pole grid (`crs=native`, no resampling to lon/lat),
+    wind speed on the full model domain, every 4th model level from level 4 (8 levels per request), 4×4
+    averaged, as a volume filled above 50 kt with vertical scale ×10, with the sky and the earth surface on.
   - *Jet stream – Nordic (MEPS, meteocore)*: the MEPS forecast from FMI's meteocore
     (`https://meteocore.app.meteo.fi/edr`), wind speed on 13 pressure levels (1000–50 hPa) at their height,
     filled above 25 m/s (≈ 50 kt) with vertical scale ×15. The full domain at the native 2.5 km grid is over
@@ -98,6 +100,10 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   many points in x and y (EDR `resolution-x` / `resolution-y`), for servers that support it; empty uses the
   server's own grid. Unlike the horizontal step, which averages after downloading, this makes the requests
   smaller, which servers with a size limit need for large areas.
+  On a native grid whose size the server gives in `crs_details` (adaguc-server), the *horizontal step* is
+  asked from the server this way too: with step 4, `resolution-x/-y` for a quarter of the cells, so the server
+  sends every 4th native cell instead of all of them, 16× less to send and parse. A server that ignores
+  `resolution-x/-y` sends every cell, and the viewer averages them as before.
 
 - **Native grid.** When a collection lists a rotated pole CRS in the cube's `crs_details` (adaguc-server
   with `crs=native`), the *Grid* selector offers it and uses it by default. The cube then comes back on the

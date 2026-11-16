@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as topojson from 'topojson-client';
-import { fetchJSON, parseTemporalValues, parseCubeUrl, toIso, loadCube } from './edr.js';
+import { fetchJSON, parseTemporalValues, parseCubeUrl, toIso, loadCube, MAX_POINTS_PER_LEVEL } from './edr.js';
 import { marchingCubes } from './isosurface.js';
 import { COLORMAP_NAMES, makeColormapTexture, drawColorbar, hexToRgb } from './colormaps.js';
 import { resampleVolume, createVolumeMaterial, createVolumeTexture, updateVolumeCamera } from './volume.js';
@@ -63,7 +63,7 @@ const pressureParamOf = (collection) =>
 // One-click views. collectionUrl: switch to this collection first (latest instance);
 // crs: 'native' = the model's own grid (when the collection offers it), otherwise EPSG:4326;
 // bbox: 'full' = model domain extent, or [W, S, E, N]; levels: 'all' or [from, to];
-// stride: horizontal step ('auto' or 1–4); levelStep: vertical step (every n-th level, 1–5); gridCells: draw the grid cells;
+// stride: horizontal step ('auto' or 1–8); levelStep: vertical step (every n-th level, 1–8); gridCells: draw the grid cells;
 // sky / earth: sky with horizon and stars, earth surface around the data;
 // threshold sets the first isosurface value (also the volume's fill threshold); density: volume density (0.05–20);
 // resolution: [x, y] points the server resamples to (EDR resolution-x/-y), for servers with a size limit;
@@ -71,11 +71,11 @@ const pressureParamOf = (collection) =>
 const PRESETS = [
   {
     name: 'Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)',
-    description: 'KNMI UWCW HARMONIE DINI 5.5 km from geoservices.knmi.nl: wind speed on the full domain, every 4th model level from level 4, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
+    description: 'KNMI UWCW HARMONIE DINI 5.5 km from geoservices.knmi.nl, on its native rotated pole grid: wind speed on the full domain, every 4th model level from level 4, 4×4 averaged, volume filled above 50 kt, vertical scale ×10',
     collectionUrl: DEFAULT_COLLECTION,
-    crs: '',
+    crs: 'native', // the model's rotated pole grid, without resampling to lon/lat
     bbox: 'full',
-    stride: '4', // horizontal step: 'auto' or 1–4
+    stride: '4', // horizontal step: 'auto' or 1–8
     levelStep: 4,
     levelsPerRequest: 8,
     parameter: 'wind_speed_ml',
@@ -750,21 +750,23 @@ function buildRequest(datetime = $('datetime').value) {
     : Array.from({ length: Math.round(levelTo) - Math.round(levelFrom) + 1 }, (_, n) => Math.round(levelFrom) + n);
   const levels = inRange.filter((_, n) => n % levelStep === 0);
   if (!levels.length) throw new Error(`No ${vertical.label || 'levels'} between ${levelFrom} and ${levelTo}`);
+  // The panel bbox is lon/lat; with a native crs the request bbox must be in native (rotated) coordinates
+  const bbox = proj ? bboxToRot(proj, readBBox()) : readBBox();
+  const stride = $('stride').value === 'auto' ? 'auto' : Number($('stride').value);
   const opts = {
     collectionUrl: state.collectionUrl || $('collectionUrl').value.trim(),
     instance: $('instance').value,
     datetime,
-    // The panel bbox is lon/lat; with a native crs the request bbox must be in native (rotated) coordinates
-    bbox: proj ? bboxToRot(proj, readBBox()) : readBBox(),
+    bbox,
     crs: crs || undefined,
     levelFrom, levelTo, params, levels, levelStep,
     allLevels: vertical.values.length ? vertical.values : inRange,
     levelsPerRequest: Number($('levelsPerRequest').value) || 5,
-    stride: $('stride').value === 'auto' ? 'auto' : Number($('stride').value),
+    stride,
     fixScale: $('fixScale').value,
     concurrency: Number($('concurrency').value) || 6,
     angleParams: wind ? [wind.dir] : [], // averaged as unit vectors with a horizontal step
-    resolution: serverResolution(),
+    resolution: serverResolution() ?? nativeResolution(proj, bbox, stride),
   };
   const vkind = vertical.kind, vmodeUsed = vkind === 'level' ? vmode : 'level';
   const meta = { param, selection, wind, vmode: vmodeUsed, vkind, pressureParam, crs, proj, unit: paramUnit(param), datetime, instance: opts.instance };
@@ -778,6 +780,20 @@ function serverResolution() {
   const m = /^(\d+)\s*[x×*, ]\s*(\d+)$/i.exec(text);
   if (!m || +m[1] < 2 || +m[2] < 2) throw new Error(`Server resolution "${text}": use e.g. 300x300, or leave it empty`);
   return [+m[1], +m[2]];
+}
+
+// On a native grid of known size, a horizontal step is asked from the server (EDR resolution-x/-y): every n-th
+// native cell instead of all of them, so much less to generate, send and parse. A server that does not support it
+// sends every cell, and loadCube averages them as before. null: no step, or the native grid size is unknown.
+function nativeResolution(proj, bbox, stride) {
+  const native = state.native;
+  if (!proj || !native?.bbox || !native?.cellsize) return null;
+  const [gx0, gy0, gx1, gy1] = native.bbox, [cx, cy] = native.cellsize;
+  const cellsX = Math.ceil((Math.min(bbox[2], gx1) - Math.max(bbox[0], gx0)) / cx - 1e-6);
+  const cellsY = Math.ceil((Math.min(bbox[3], gy1) - Math.max(bbox[1], gy0)) / cy - 1e-6);
+  if (!(cellsX > 0 && cellsY > 0)) return null;
+  const step = stride === 'auto' ? Math.ceil(Math.sqrt((cellsX * cellsY) / MAX_POINTS_PER_LEVEL)) : Math.round(stride);
+  return step > 1 ? [Math.ceil(cellsX / step), Math.ceil(cellsY / step)] : null;
 }
 
 // Loaded cubes, so animating or stepping back to a time does not load it again. Oldest used are dropped first.
@@ -873,7 +889,8 @@ async function loadData({ force = false } = {}) {
     if (state.abort !== ac) return; // another load or the animation took over
     showGrid(grid);
     const s = ((performance.now() - t0) / 1000).toFixed(1);
-    const step = grid.stride > 1 ? ` (${grid.sourceSize.join('×')} averaged ${grid.stride}×${grid.stride})` : '';
+    const step = grid.stride > 1 ? ` (${grid.sourceSize.join('×')} averaged ${grid.stride}×${grid.stride})`
+      : grid.serverReduced ? ' (fewer cells, chosen by the server)' : '';
     setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${grid.proj ? ' on the native grid' : ''}${step} with ${grid.requests} request${grid.requests > 1 ? 's' : ''} in ${s} s` +
       (grid.scaleFixed ? ` (×10 server fix applied to ${grid.scaleFixed} response${grid.scaleFixed > 1 ? 's' : ''})` : ''));
   } catch (e) {
@@ -932,8 +949,11 @@ async function startAnimation() {
       const request = buildRequest(times[next]);
       if (!cachedFrame(request.key)) $('vcAnimInfo').textContent = 'loading…';
       const grid = await fetchFrame(request, { signal });
-      // Load the time after this one while this one is shown
-      fetchFrame(buildRequest(times[(next + 1) % times.length]), { signal }).catch(() => {});
+      // Load the next times while this one is shown (Prefetch in the view bar)
+      const ahead = Number($('vcPrefetch').value) || 1;
+      for (let a = 1; a <= Math.min(ahead, times.length - 1); a++) {
+        fetchFrame(buildRequest(times[(next + a) % times.length]), { signal }).catch(() => {});
+      }
       await sleep(Number($('vcSpeed').value) - (performance.now() - t0));
       if (!anim.playing) break;
       $('datetime').value = times[next];

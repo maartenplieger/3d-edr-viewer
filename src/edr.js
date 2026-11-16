@@ -171,7 +171,7 @@ function fixScaleBug(json, mode) {
   return fixed;
 }
 
-const MAX_POINTS_PER_LEVEL = 100000; // 'auto' horizontal step keeps levels below this size
+export const MAX_POINTS_PER_LEVEL = 100000; // 'auto' horizontal step keeps levels below this size
 
 /**
  * Loads a 3D cube into a regular grid with x/y ascending and levels ascending.
@@ -224,12 +224,16 @@ export async function loadCube(o, { signal, onProgress, onUrl } = {}) {
     if (grid) return;
     const xs = axisValues(domain.axes.x).map(Number);
     const ys = axisValues(domain.axes.y).map(Number);
-    const stride = o.stride && o.stride !== 'auto' ? Math.max(1, Math.round(o.stride))
-      : Math.max(1, Math.ceil(Math.sqrt((xs.length * ys.length) / MAX_POINTS_PER_LEVEL)));
+    // Already within the requested resolution-x/-y: the server reduced the grid, so it is not averaged again.
+    // A server that ignores resolution-x/-y sends every cell, which is then averaged here as before.
+    const serverReduced = !!o.resolution && xs.length <= o.resolution[0] && ys.length <= o.resolution[1];
+    const stride = serverReduced ? 1
+      : o.stride && o.stride !== 'auto' ? Math.max(1, Math.round(o.stride))
+        : Math.max(1, Math.ceil(Math.sqrt((xs.length * ys.length) / MAX_POINTS_PER_LEVEL)));
     const bx = blockAxis(xs, stride), by = blockAxis(ys, stride);
     const nx = bx.centers.length, ny = by.centers.length, nz = levels.length;
     grid = {
-      nx, ny, nz, levels, stride,
+      nx, ny, nz, levels, stride, serverReduced,
       sourceSize: [xs.length, ys.length],
       lons: bx.centers,
       lats: by.centers,
