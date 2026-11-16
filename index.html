@@ -223,16 +223,18 @@
       <label class="check" title="The sun and the moon (with its phase) where they are at the shown time, seen from the centre of the data: the sun's light, and daylight in the sky"><input id="sunOn" type="checkbox"> Sun and moon at the shown time</label>
       <label class="check" title="Names of the brightest stars (with the sky)"><input id="starNamesOn" type="checkbox"> Star names</label>
       <label class="check" title="Wrap the scene around the Earth: the data at its real place and curvature on a globe"><input id="globeOn" type="checkbox"> Globe</label>
-      <label class="check" title="While animating, also show the data interpolated between two times, e.g. every 10 minutes between hourly times: smoother motion, no extra data loaded">In between
+      <label class="check" title="While animating, also show the data interpolated between two times, e.g. every 10 minutes between hourly times, or continuously: smoother motion, no extra data loaded. When only the volume is shown this is done on the graphics card and costs (almost) nothing.">In between
         <select id="tweenStep" class="inline">
           <option value="0">off</option>
+          <option value="-1" selected>continuous</option>
           <option value="5">every 5 min</option>
-          <option value="10" selected>every 10 min</option>
+          <option value="10">every 10 min</option>
           <option value="15">every 15 min</option>
           <option value="30">every 30 min</option>
         </select></label>
       <label class="check" title="The base map continued around the data (about 7× the area) with degree lines"><input id="earthOn" type="checkbox"> Earth surface around the data</label>
       <label class="check"><input id="hazeOn" type="checkbox" checked> Depth haze (fade distant data)</label>
+      <label class="check" title="Frame rate counter in the bottom right of the view"><input id="fpsOn" type="checkbox" checked> Frame rate</label>
       <label class="slider">Haze amount <input id="hazeAmount" type="range" min="0.05" max="1" step="0.05" value="0.4"><output></output></label>
       <button id="resetView">Reset view</button>
     </details>
@@ -257,6 +259,13 @@
             <option value="500" selected>0.5 s</option>
             <option value="1000">1 s</option>
             <option value="2000">2 s</option>
+          </select>
+          <select id="vcSteps" class="speed" title="Loop length: how many times the animation loops over, from the time shown when ▶ is pressed (shifted back if the run ends before). Pausing and playing again keeps the loop; ⏹ goes back to its first time.">
+            <option value="all" selected>all times</option>
+            <option value="6">6 times</option>
+            <option value="12">12 times</option>
+            <option value="24">24 times</option>
+            <option value="48">48 times</option>
           </select>
           <select id="vcPrefetch" class="speed" title="Times loaded ahead while animating: more keeps the server busy while a time is shown">
             <option value="1">ahead 1</option>
@@ -292,6 +301,9 @@
       <label id="vcStreamWrap" class="vc-check" title="Particles moving with the wind, inside the volume" hidden>
         <span class="vc-inline"><input id="vcStream" type="checkbox" checked> Streamlines</span>
       </label>
+      <label class="vc-check" title="Circle slowly around the data, from a distance where all of it is in view, rising and sinking a little. Dragging and zooming still work; flying with the keys stops it.">
+        <span class="vc-inline"><input id="vcTour" type="checkbox"> Fly around</span>
+      </label>
       <label class="vc-vscale">Vertical scale
         <span class="vc-inline">
           <input id="vcVscale" type="range" min="-1" max="1.5" step="any">
@@ -301,7 +313,8 @@
     </div>
     <div id="hud"></div>
     <div id="flightInfo" class="flight-info" aria-live="off"></div>
-    <div id="loadBlocks" class="load-blocks" aria-live="off"><div class="lb-label"></div><div class="lb-row"></div></div>
+    <div id="fps" class="fps" aria-live="off" title="Frames drawn per second, the longest time between two frames, and the main-thread time per frame (the page and three.js preparing the drawing; the graphics card works on after that). The view is only drawn when something changes: idle when nothing moves."></div>
+    <div id="loadBlocks" class="load-blocks" aria-live="off" title="Time line: a block per time of the run, filled when loaded. Click or drag to show any moment, also between two times (pauses the animation)."><div class="lb-label"></div><div class="lb-track"><div class="lb-row"></div><div class="lb-head"></div></div></div>
     <div class="keys-hint">Fly: <kbd>W</kbd><kbd>S</kbd> faster/slower, backwards · <kbd>↑</kbd><kbd>↓</kbd> pitch ·
       <kbd>←</kbd><kbd>→</kbd> roll · <kbd>A</kbd><kbd>D</kbd> rudder · <kbd>R</kbd> level · <kbd>Shift</kbd> boost ·
       <kbd>Space</kbd> stop · mouse: orbit</div>

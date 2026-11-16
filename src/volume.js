@@ -58,6 +58,8 @@ export function createVolumeMaterial(shared) {
   const uniforms = {
     ...shared, // cmap, vmin, vmax, isoValues, isoColors shared with the slice material
     vol: { value: null },
+    vol2: { value: null }, // the next time, blended in by blend (0 … 1): in-between frames on the GPU
+    blend: { value: 0 },
     texSize: { value: new THREE.Vector3(1, 1, 1) },
     cameraLocal: { value: new THREE.Vector3() },
     style: { value: 2 },
@@ -104,7 +106,8 @@ export function createVolumeMaterial(shared) {
       }`,
     fragmentShader: /* glsl */ `
       precision highp sampler3D;
-      uniform sampler3D vol;
+      uniform sampler3D vol, vol2;
+      uniform float blend;
       uniform sampler2D cmap;
       uniform vec3 texSize;
       uniform float cmin, cmax, width, density, steps, useCmap, isoCount;
@@ -153,7 +156,10 @@ export function createVolumeMaterial(shared) {
       }
       // Value at p (averaged over valid neighbours only); valid receives the validity weight.
       float sampleVol(vec3 p, out float valid) {
-        vec2 s = texture(vol, (p * (texSize - 1.0) + 0.5) / texSize).rg;
+        vec3 tc = (p * (texSize - 1.0) + 0.5) / texSize;
+        vec2 s = texture(vol, tc).rg;
+        // Between two times: both (value × validity, validity) pairs mixed, so where only one has data that one counts
+        if (blend > 0.0) s = mix(s, texture(vol2, tc).rg, blend);
         valid = s.g;
         return s.r / max(s.g, 1e-4);
       }

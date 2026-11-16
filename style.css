@@ -200,7 +200,7 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); }
 .flight-info {
   position: absolute;
   right: 12px;
-  bottom: 10px;
+  bottom: 30px; /* above the frame rate */
   padding: 6px 10px;
   background: rgba(22, 28, 35, 0.86);
   border: 1px solid var(--border);
@@ -215,7 +215,22 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); }
 }
 .flight-info.visible { opacity: 1; }
 .flight-info b { color: var(--text); }
-@media (max-width: 1100px) { .flight-info { bottom: 90px; } }
+@media (max-width: 1100px) { .flight-info { bottom: 90px; } } /* the HUD moves to the bottom right there */
+
+/* Frame rate: bottom right (bottom left on narrow screens, where the HUD takes the bottom right) */
+.fps {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  color: var(--muted);
+  font: 11px ui-monospace, monospace;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+  white-space: pre;
+}
+.fps b { color: var(--text); font-weight: normal; }
+.fps .slow { color: #ffb347; }
+@media (max-width: 1100px) { .fps { right: auto; left: 12px; } }
 
 /* While times are loading: a block per time of the run, filled as it loads */
 .load-blocks {
@@ -231,14 +246,29 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); }
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.6s;
+  touch-action: none;
+  user-select: none;
 }
-.load-blocks.visible { opacity: 1; }
+.load-blocks.visible { opacity: 1; pointer-events: auto; cursor: ew-resize; }
+.lb-track { position: relative; padding: 3px 0; }
+.lb-head { /* the shown moment: moves smoothly while animating, dragged to scrub */
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: var(--text);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
 .lb-label { color: var(--muted); font-size: 11px; margin-bottom: 5px; font-variant-numeric: tabular-nums; }
-.lb-row { display: flex; gap: 2px; height: 10px; }
+.lb-row { display: flex; gap: 2px; height: 12px; }
 .lb { flex: 1; min-width: 2px; background: var(--panel-2); border-radius: 2px; overflow: hidden; position: relative; }
 .lb > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }
 .lb.done > i { opacity: 0.75; }
 .lb.stored > i { opacity: 0.3; }
+.lb.out { opacity: 0.35; } /* outside the animation loop */
 .lb.loading { animation: lb-pulse 1.2s ease-in-out infinite; }
 .lb.current { box-shadow: 0 0 0 1px var(--text); }
 @keyframes lb-pulse { 50% { background: #2c3845; } } /* the HUD moves to the bottom right there */

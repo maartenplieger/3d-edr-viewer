@@ -116,7 +116,7 @@ const PRESETS = [
     globe: true,
     sun: true,
     starNames: true,
-    tween: 10,
+    tween: -1, // continuous: on the GPU while only the volume is shown
     view: { azimuth: 150, elevation: 30, distance: 0.95 }, // from the south-east, above the Mediterranean
   },
   {
@@ -538,8 +538,66 @@ function localUp(out) {
   return out.copy(camera.position).sub(skyTmp.centre.fromArray(globe.centre)).normalize();
 }
 
+// Fly around (view bar): the camera circles the centre of the data, one turn in TOUR.period seconds, rising and
+// sinking a little. On starting it moves smoothly to a distance where all the data is in view (or stays further
+// out) at a moderate elevation; after that, dragging and zooming change the circle and it goes on from there.
+const TOUR = { period: 120, bob: THREE.MathUtils.degToRad(6), bobPeriod: 40, settle: 3 };
+const tour = { active: false, time: 0, settle: 0, distance: 0, elevation: 0 };
+const tourTmp = { off: new THREE.Vector3(), z: new THREE.Vector3(0, 0, 1), center: new THREE.Vector3() };
+
+function startTour() {
+  if (!state.geo) return;
+  endFlight();
+  const sphere = dataBounds(tmpBox).getBoundingSphere(tmpSphere);
+  const halfFov = THREE.MathUtils.degToRad(camera.fov / 2), aspect = camera.aspect;
+  const fit = (sphere.radius * 1.1) / Math.sin(Math.min(halfFov, Math.atan(Math.tan(halfFov) * aspect))); // all in view
+  const off = tourTmp.off.copy(camera.position).sub(controls.target);
+  const r = off.length() || fit;
+  Object.assign(tour, {
+    active: true, time: 0, settle: 0,
+    distance: Math.max(r, fit),
+    elevation: THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp(off.z / r, -1, 1)), THREE.MathUtils.degToRad(15), THREE.MathUtils.degToRad(45)),
+  });
+  tourTmp.center.copy(sphere.center);
+  requestRender();
+}
+
+function stopTour() {
+  tour.active = false;
+  $('vcTour').checked = false;
+}
+
+// Moves the camera along the circle; true while touring (so the view keeps being drawn)
+function updateTour(dt) {
+  if (!tour.active || flight.active || !state.geo) return false;
+  tour.time += dt;
+  const off = tourTmp.off.copy(camera.position).sub(controls.target);
+  let r = off.length();
+  let az = Math.atan2(off.x, off.y), el = Math.asin(THREE.MathUtils.clamp(off.z / r, -1, 1));
+  // Settling in: towards the centre of the data, the distance and elevation chosen at the start
+  if (tour.settle < 1) {
+    tour.settle = Math.min(1, tour.settle + dt / TOUR.settle);
+    const k = 1 - Math.exp(-dt * 2.5);
+    controls.target.lerp(tourTmp.center, k);
+    r += (tour.distance - r) * k;
+    el += (tour.elevation - el) * k;
+  }
+  // Around, and a little up and down
+  az -= ((2 * Math.PI) / TOUR.period) * dt;
+  const w = (2 * Math.PI) / TOUR.bobPeriod;
+  el += TOUR.bob * (Math.sin(tour.time * w) - Math.sin((tour.time - dt) * w));
+  el = THREE.MathUtils.clamp(el, THREE.MathUtils.degToRad(2), THREE.MathUtils.degToRad(85));
+  camera.position.set(
+    controls.target.x + r * Math.cos(el) * Math.sin(az),
+    controls.target.y + r * Math.cos(el) * Math.cos(az),
+    controls.target.z + r * Math.sin(el),
+  );
+  return true;
+}
+
 function startFlight() {
   if (flight.active || !state.geo) return;
+  if (tour.active) stopTour(); // the keys take over
   flight.active = true;
   controls.enabled = false;
   flight.q.copy(camera.quaternion);
@@ -744,15 +802,47 @@ function requestRender(frames = 2) {
 for (const type of ['input', 'change', 'click', 'keydown', 'keyup']) document.addEventListener(type, () => requestRender(), true);
 controls.addEventListener('change', () => requestRender());
 
+// Frame rate (Appearance → Frame rate): frames drawn per second, the longest gap between two frames (a stutter
+// shows up there) and the page's own time per frame, over half a second. The view is drawn on demand: idle when
+// nothing has been drawn for a while.
+const fpsStats = { frames: 0, since: performance.now(), last: 0, worst: 0, js: 0, shownIdle: false, drawing: false };
+// wasDrawing: the previous display frame was drawn too, so the gap is a stutter, not a pause after idling
+function countFrame(start, end, wasDrawing) {
+  const s = fpsStats;
+  if (wasDrawing) s.worst = Math.max(s.worst, start - s.last);
+  s.last = start;
+  s.drawing = true;
+  s.frames++;
+  s.js += end - start;
+}
+function updateFps(now) {
+  const s = fpsStats, el = $('fps');
+  el.hidden = !$('fpsOn').checked;
+  if (el.hidden || now - s.since < 500) return;
+  if (s.frames) {
+    const fps = (s.frames * 1000) / (now - s.since);
+    el.innerHTML = `<b>${fps.toFixed(0).padStart(3)}</b> fps · worst <span class="${s.worst > 50 ? 'slow' : ''}">${s.worst.toFixed(0).padStart(3)} ms</span> · cpu ${(s.js / s.frames).toFixed(1).padStart(4)} ms`;
+    s.shownIdle = false;
+  } else if (!s.shownIdle && now - s.last > 1000) {
+    el.innerHTML = '<b>idle</b> · drawn when something changes';
+    s.shownIdle = true;
+  }
+  Object.assign(s, { frames: 0, since: now, worst: 0, js: 0 });
+}
+
 renderer.setAnimationLoop((now) => {
+  const frameStart = performance.now(), wasDrawing = fpsStats.drawing;
+  fpsStats.drawing = false; // until this frame is drawn
+  updateFps(frameStart);
   const dt = Math.min(flyClock.getDelta(), 0.1); // capped, so a stalled frame does not jump far
   fly(dt);
+  const touring = updateTour(dt);
   const cameraMoved = flight.active ? false : controls.update(); // while flying the plane has the camera
   updateFlightInfo(now);
   streamlines.update(dt);
   const skyMoving = advanceSkyClock(now);
   const flying = flight.active && (flyKeys.size > 0 || flightMoving());
-  if (!(cameraMoved || flying || skyMoving || streamlines.object.visible || pickPending || renderFrames > 0)) return;
+  if (!(cameraMoved || touring || flying || skyMoving || streamlines.object.visible || pickPending || renderFrames > 0)) return;
   if (renderFrames > 0) renderFrames--;
   if (globe) fitClipPlanes();
   updateSkyObjects();
@@ -763,6 +853,8 @@ renderer.setAnimationLoop((now) => {
     pick();
   }
   renderer.render(scene, camera);
+  updatePlayhead();
+  countFrame(frameStart, performance.now(), wasDrawing);
 });
 
 // ---------------------------------------------------------------- helpers
@@ -1161,20 +1253,26 @@ function updateLoadBlocks() {
   });
 }
 
+// The time line stays in view once there are times to show (and while anything loads)
+const timelineWanted = () => framesLoading.size > 0 || (!!state.grid && $('datetime').options.length > 1);
 function drawLoadBlocks() {
   const el = $('loadBlocks');
-  if (framesLoading.size) {
+  if (timelineWanted()) {
     clearTimeout(loadBlocksHide);
     loadBlocksHide = null;
     el.classList.add('visible');
   } else if (el.classList.contains('visible') && !loadBlocksHide) {
-    loadBlocksHide = setTimeout(() => { el.classList.remove('visible'); loadBlocksHide = null; }, 1500);
+    loadBlocksHide = setTimeout(() => {
+      loadBlocksHide = null;
+      if (timelineWanted()) drawLoadBlocks();
+      else el.classList.remove('visible');
+    }, 1500);
   }
   if (!el.classList.contains('visible')) return;
   const times = [...$('datetime').options].map((o) => o.value);
   let keys;
   try {
-    keys = times.map((t) => buildRequest(t).key);
+    keys = timelineKeys(times);
   } catch {
     return; // the panel settings are not valid (yet)
   }
@@ -1191,11 +1289,133 @@ function drawLoadBlocks() {
     const stored = !inMemory && f == null && storedKeys.has(keys[n]); // in the local cache: there in a moment
     if (inMemory) loaded++;
     if (stored) local++;
-    b.className = `lb${inMemory ? ' done' : f != null ? ' loading' : stored ? ' stored' : ''}${t === state.grid?.datetime ? ' current' : ''}`;
+    b.className = `lb${inMemory ? ' done' : f != null ? ' loading' : stored ? ' stored' : ''}${t === state.grid?.datetime ? ' current' : ''}${inAnimationLoop(n) ? '' : ' out'}`;
     b.firstChild.style.width = `${inMemory || stored ? 100 : f != null ? Math.round(f * 100) : 0}%`;
   });
-  el.querySelector('.lb-label').textContent = `${loaded} of ${times.length} times in memory` +
+  timelineCounts = `${loaded} of ${times.length} times in memory` +
     (local ? `, ${local} more in the local cache` : '') + (framesLoading.size ? ` · loading ${framesLoading.size}` : '');
+  updatePlayhead(true);
+}
+
+// The request key of every time, for the current panel settings: only the time differs between them, so they are
+// derived from the first one (the bar is redrawn on every shown frame)
+let keysCache = { base: '', times: '', keys: [] };
+function timelineKeys(times) {
+  const base = buildRequest(times[0]).key, joined = times.join();
+  if (keysCache.base !== base || keysCache.times !== joined) {
+    const first = JSON.stringify(times[0]);
+    keysCache = { base, times: joined, keys: times.map((t) => base.replace(first, JSON.stringify(t))) };
+  }
+  return keysCache.keys;
+}
+
+// ---- Time line: the playhead on the block bar, and scrubbing by clicking or dragging it
+// Position u: 0 … number of times - 1, fractional between two times (block n is centred on n).
+const scrub = { dragging: false, pending: null, busy: false, token: 0 };
+let timelineCounts = '', timelineLabel = '', timelineMs = { key: '', ms: [] };
+
+function timelineTimes() {
+  const opts = $('datetime').options, key = `${opts.length}:${opts[0]?.value}:${opts[opts.length - 1]?.value}`;
+  if (timelineMs.key !== key) timelineMs = { key, ms: [...opts].map((o) => Date.parse(o.value)), iso: [...opts].map((o) => o.value) };
+  return timelineMs;
+}
+
+// The playhead at the shown moment (the sky's clock while animating, so it moves smoothly)
+function updatePlayhead(force = false) {
+  const el = $('loadBlocks');
+  if (!el.classList.contains('visible') && !force) return;
+  const { ms } = timelineTimes(), n = ms.length;
+  if (!n || !state.grid) return;
+  const t = skyTime();
+  let u = 0;
+  if (t >= ms[n - 1]) u = n - 1;
+  else if (t > ms[0]) {
+    let i = 0;
+    while (i < n - 2 && ms[i + 1] <= t) i++;
+    u = i + (t - ms[i]) / (ms[i + 1] - ms[i]);
+  }
+  el.querySelector('.lb-head').style.left = `${((u + 0.5) / n) * 100}%`;
+  const label = `${toIso(Math.round(t / 60000) * 60000).replace('T', ' ').slice(0, 16)}Z · ${timelineCounts}`;
+  if (label !== timelineLabel || force) el.querySelector('.lb-label').textContent = timelineLabel = label;
+}
+
+// Shows the moment at position u: a loaded time, or in between two (blended on the GPU when only the volume is
+// shown, interpolated on the CPU otherwise), following the In between setting (off: the nearest time)
+async function showTimelineAt(u) {
+  const { ms, iso } = timelineTimes(), n = ms.length;
+  if (n < 1) return;
+  u = THREE.MathUtils.clamp(u, 0, n - 1);
+  const mode = Number($('tweenStep').value);
+  let i = Math.min(Math.floor(u), n - 1), f = u - i;
+  if (mode === 0 || i === n - 1) {
+    i = Math.min(Math.round(u), n - 1);
+    f = 0;
+  } else if (mode > 0) {
+    const span = ms[i + 1] - ms[i], q = mode * 60000;
+    f = (Math.round((f * span) / q) * q) / span;
+    if (f >= 1) { i++; f = 0; }
+  }
+  if (f < 1e-4) f = 0;
+  const token = ++scrub.token;
+  let a, b = null;
+  try {
+    a = await fetchFrame(buildRequest(iso[i]));
+    if (f > 0) b = await fetchFrame(buildRequest(iso[i + 1]));
+  } catch (e) {
+    if (e.name !== 'AbortError') setStatus(e.message, true);
+    return;
+  }
+  if (token !== scrub.token) return; // dragged on meanwhile
+  $('datetime').value = iso[i];
+  if (b && sameShape(a, b)) {
+    const time = toIso(Math.round((ms[i] + f * (ms[i + 1] - ms[i])) / 60000) * 60000);
+    if (state.grid !== a && canBlendOnGpu()) showGrid(a);
+    if (state.grid === a && canBlendOnGpu() && (state.volume?.nextGrid === b || prepareVolumeBlend(b))) setVolumeBlend(f, time);
+    else showGrid(interpolateGrid(a, b, f, time));
+  } else if (state.grid !== a) {
+    showGrid(a);
+  } else if (gpuTween) {
+    resetVolumeBlend();
+    requestRender();
+  }
+  updateSun({ hud: !f }); // the HUD keeps the loaded time
+  setStatus(`Time ${shownTimeOf(state.grid) || iso[i]}${f ? ' (in between)' : ''}`);
+}
+
+// One position at a time: while one is being shown, only the newest of the positions dragged over waits
+async function scrubTo(u) {
+  scrub.pending = u;
+  if (scrub.busy) return;
+  scrub.busy = true;
+  try {
+    while (scrub.pending != null) {
+      const next = scrub.pending;
+      scrub.pending = null;
+      await showTimelineAt(next);
+    }
+  } finally {
+    scrub.busy = false;
+  }
+}
+
+{
+  const bar = $('loadBlocks');
+  const positionOf = (e) => {
+    const r = bar.querySelector('.lb-row').getBoundingClientRect(), n = timelineTimes().ms.length;
+    return ((e.clientX - r.left) / r.width) * n - 0.5;
+  };
+  bar.addEventListener('pointerdown', (e) => {
+    if (!bar.classList.contains('visible') || !state.grid) return;
+    stopAnimation(); // scrubbing pauses; the loop is kept
+    scrub.dragging = true;
+    try { bar.setPointerCapture(e.pointerId); } catch { /* e.g. a synthetic event: no capture */ }
+    scrubTo(positionOf(e));
+    e.preventDefault();
+  });
+  bar.addEventListener('pointermove', (e) => { if (scrub.dragging) scrubTo(positionOf(e)); });
+  const end = () => { scrub.dragging = false; };
+  bar.addEventListener('pointerup', end);
+  bar.addEventListener('pointercancel', end);
 }
 
 // The grid for a request: from the cache, from a load already running, or loaded now
@@ -1230,7 +1450,7 @@ function fetchFrame({ opts, meta, key }, { signal, onProgress, onUrl } = {}) {
 
 function showGrid(grid) {
   requestRender();
-  queueMicrotask(updateSun); // the sun follows the shown time
+  queueMicrotask(() => updateSun({ hud: !grid.shownTime })); // the sun follows the shown time; the HUD the loaded one
   // Keep the camera when only the time or parameter changed; fit it again for a new area, grid or levels
   const refit = !state.grid || viewKey(state.grid) !== viewKey(grid);
   state.grid = grid;
@@ -1301,13 +1521,33 @@ async function loadData() {
 // Steps through the times of the instance, wrapping around. The next time is loaded while the current one is
 // shown, and every loaded time stays in the frame cache, so the second loop plays from memory.
 
-const anim = { playing: false, abort: null };
+const anim = { playing: false, abort: null, loop: null }; // loop: { instance, start, n } (indices into the times)
+
+// The animation loop (Loop length in the view bar): n times from start. A new loop starts at the shown time,
+// shifted back so it has its full length when the run ends sooner; playing again within the loop keeps it.
+const loopSetting = (count) => ($('vcSteps').value === 'all' ? count : Math.min(Number($('vcSteps').value), count));
+function animationLoop(times, index) {
+  const n = loopSetting(times.length), l = anim.loop;
+  const same = l && l.instance === $('instance').value && l.count === times.length;
+  if (same && index >= l.start && index < l.start + l.n) return l; // a changed length applies from the same start
+  anim.loop = { instance: $('instance').value, count: times.length, start: Math.max(0, Math.min(index, times.length - n)), n };
+  return anim.loop;
+}
+const inAnimationLoop = (i) => {
+  const l = anim.loop;
+  if (!l || l.instance !== $('instance').value || l.count !== $('datetime').options.length) return true;
+  return i >= l.start && i < l.start + l.n;
+};
 
 // While animating, the sun, moon and stars do not jump from one time to the next: the sky's time runs smoothly
 // from the shown time to the next one during the frame interval, and waits there if the next one is still loading
-const skyClock = { from: null, to: null, start: 0, duration: 1, shown: null, hudAt: 0 };
+const skyClock = { from: null, to: null, start: 0, duration: 1, shown: null };
+// The time an in-between frame shows: its own (interpolated on the CPU), or the volume's blend (on the GPU)
+let gpuTween = null; // { grid, time }: the volume of grid is blended towards the next time
+const shownTimeOf = (g) => g?.shownTime || (gpuTween && gpuTween.grid === g ? gpuTween.time : null);
+
 function skyTime() {
-  const shown = state.grid?.shownTime || state.grid?.datetime; // an in-between frame has its own time
+  const shown = shownTimeOf(state.grid) || state.grid?.datetime; // an in-between frame has its own time
   const fallback = shown ? Date.parse(shown) : Date.now();
   if (!anim.playing || skyClock.from == null) return fallback;
   const f = THREE.MathUtils.clamp((performance.now() - skyClock.start) / skyClock.duration, 0, 1);
@@ -1358,8 +1598,7 @@ function advanceSkyClock(now) {
   if (!(sunGroup.visible || celestialGroup.visible)) return false;
   const t = skyTime();
   if (t === skyClock.shown) return false;
-  updateSun({ hud: now - skyClock.hudAt > 250 }); // the HUD a few times a second
-  if (now - skyClock.hudAt > 250) skyClock.hudAt = now;
+  updateSun({ hud: false }); // the HUD stays calm: it follows the loaded times, the time line the moment
   return true;
 }
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
@@ -1368,7 +1607,8 @@ function updatePlayButton() {
   $('vcPlay').textContent = anim.playing ? '\u23F8\uFE0E' : '\u25B6\uFE0E'; // text, not emoji, symbols
   $('vcPlay').title = anim.playing ? 'Pause the animation' : 'Animate over time';
   $('vcPlay').classList.toggle('active', anim.playing);
-  $('vcStop').disabled = !anim.playing && $('vcTime').selectedIndex <= 0;
+  $('vcStop').disabled = !anim.playing && $('vcTime').value === firstTime(); // already at the start
+  updateLoadBlocks();
 }
 
 function stopAnimation() {
@@ -1395,20 +1635,26 @@ async function startAnimation() {
   const { signal } = anim.abort;
   updatePlayButton();
   let index = Math.max(0, times.indexOf(state.grid?.datetime ?? $('datetime').value));
+  const loop = animationLoop(times, index);
+  // The time after i within the loop (k steps on), wrapping to its start; the loop length can change while playing
+  const after = (i, k = 1) => {
+    loop.n = Math.max(2, Math.min(loopSetting(times.length), times.length - loop.start));
+    return loop.start + ((((i - loop.start + k) % loop.n) + loop.n) % loop.n);
+  };
   let current = state.grid; // the grid shown for times[index]
   let shownAt = performance.now();
   holdSkyClock(times[index]);
   requestRender();
   try {
     while (anim.playing) {
-      const next = (index + 1) % times.length;
+      const next = after(index);
       const request = buildRequest(times[next]);
       const ready = !!cachedFrame(request.key); // loading shows in the block bar in the view
       const grid = await fetchFrame(request, { signal });
       // Load the next times while this one is shown (Prefetch in the view bar)
       const ahead = Number($('vcPrefetch').value) || 1;
-      for (let a = 1; a <= Math.min(ahead, times.length - 1); a++) {
-        fetchFrame(buildRequest(times[(next + a) % times.length]), { signal }).catch(() => {});
+      for (let a = 1; a <= Math.min(ahead, loop.n - 1); a++) {
+        fetchFrame(buildRequest(times[after(next, a)]), { signal }).catch(() => {});
       }
       if (!anim.playing) break;
       // The step to the next time starts when that one is there: from when this one was shown if it was in
@@ -1417,12 +1663,28 @@ async function startAnimation() {
       const speed = Number($('vcSpeed').value);
       startSkyClock(times[index], times[next], stepStart);
       const t0 = Date.parse(times[index]), t1 = Date.parse(times[next]);
-      const tween = Number($('tweenStep').value) * 60000;
-      if (tween > 0 && t1 - t0 > tween && sameShape(current, grid)) {
-        // In between frames at whole multiples of the interval, following the sky's clock
+      const mode = Number($('tweenStep').value); // minutes between in-between frames, -1: continuous, 0: off
+      const continuous = mode < 0, tween = continuous ? 0 : mode * 60000;
+      const tweening = mode !== 0 && t1 - t0 > tween && sameShape(current, grid);
+      if (tweening && canBlendOnGpu() && prepareVolumeBlend(grid)) {
+        // On the GPU: only the blend between this time and the next changes, following the sky's clock
+        let shown = -1;
+        while (anim.playing && performance.now() - stepStart < speed) {
+          const f = THREE.MathUtils.clamp((skyTime() - t0) / (t1 - t0), 0, 1);
+          const fq = continuous ? f : (Math.floor((f * (t1 - t0)) / tween) * tween) / (t1 - t0);
+          if (fq !== shown && fq < 1) {
+            shown = fq;
+            const time = toIso(Math.round((t0 + fq * (t1 - t0)) / 60000) * 60000); // shown to the minute
+            setVolumeBlend(fq, time); // the time line shows the moment; the HUD keeps the loaded time
+          }
+          await new Promise((res) => requestAnimationFrame(res));
+        }
+      } else if (tweening) {
+        // On the CPU: in between frames at whole multiples of the interval (5 minutes when continuous)
+        const step = tween || 5 * 60000;
         let shown = t0;
         while (anim.playing && performance.now() - stepStart < speed) {
-          const t = t0 + Math.floor((skyTime() - t0) / tween) * tween;
+          const t = t0 + Math.floor((skyTime() - t0) / step) * step;
           if (t > shown && t < t1) {
             shown = t;
             showGrid(interpolateGrid(current, grid, (t - t0) / (t1 - t0), toIso(t)));
@@ -1437,8 +1699,8 @@ async function startAnimation() {
       shownAt = performance.now();
       holdSkyClock(times[next]);
       showGrid(grid);
-      $('vcAnimInfo').textContent = `${next + 1}/${times.length}`;
-      setStatus(`Animating: ${times[next]} (${next + 1} of ${times.length}), ${frameCache.size} times in memory (${fmtBytes(frameCacheBytes)})`);
+      $('vcAnimInfo').textContent = `${next - loop.start + 1}/${loop.n}`;
+      setStatus(`Animating: ${times[next]} (${next - loop.start + 1} of ${loop.n}${loop.n < times.length ? `, times ${loop.start + 1}–${loop.start + loop.n} of ${times.length}` : ''}), ${frameCache.size} times in memory (${fmtBytes(frameCacheBytes)})`);
       index = next;
       current = grid;
       await new Promise((res) => requestAnimationFrame(res)); // let the frame be drawn
@@ -1774,7 +2036,45 @@ function disposeVolume() {
   volumeGroup.remove(state.volume.mesh);
   state.volume.mesh.geometry.dispose();
   state.volume.tex.dispose();
+  state.volume.tex2?.dispose();
+  volumeUniforms.vol2.value = null;
   state.volume = null;
+}
+
+// In-between frames on the GPU: the next time goes into a second texture once per step, and every in-between
+// frame only changes the blend between the two. Only while the volume is the only thing showing the values
+// (isosurfaces, slices and streamlines need them on the CPU); returns false when it cannot be used.
+function canBlendOnGpu() {
+  return !!state.volume && $('renderMode').value === 'volume' && !sliceGroup.children.length && !streamlines.object.visible;
+}
+
+function prepareVolumeBlend(next) {
+  const v = state.volume, g = state.grid;
+  if (!v || !sameShape(g, next) || v.geo !== state.geo) return false;
+  const { pz, zmin, zmax } = state.geo;
+  const placedByHeight = next.vkind === 'pressure' || next.vkind === 'height' || (next.vmode === 'pressure' && !!next.data[next.pressureParam]);
+  if (placedByHeight && next.vmode === 'pressure') return false; // heights from the data differ per time
+  const vol = resampleVolume(next.data[next.param], next.nx, next.ny, next.nz, pz, zmin, zmax, !placedByHeight, v.tex2?.image.data);
+  if (vol.depth !== v.tex.image.depth) return false;
+  if (v.tex2 && vol.data === v.tex2.image.data) v.tex2.needsUpdate = true;
+  else {
+    v.tex2?.dispose();
+    v.tex2 = createVolumeTexture(vol, next.nx, next.ny);
+  }
+  v.nextGrid = next;
+  volumeUniforms.vol2.value = v.tex2;
+  return true;
+}
+
+function setVolumeBlend(f, time) {
+  volumeUniforms.blend.value = f;
+  gpuTween = f > 0 ? { grid: state.grid, time } : null;
+  requestRender();
+}
+
+function resetVolumeBlend() {
+  volumeUniforms.blend.value = 0;
+  gpuTween = null;
 }
 
 function buildVolume() {
@@ -1782,7 +2082,17 @@ function buildVolume() {
   const placement = `${g?.nx}x${g?.ny}x${g?.nz}:${globe ? globe.vscale : 'flat'}`;
   // A new time of the same grid in the same place (same scene positions): only the values change, written into
   // the texture there is, without a new texture, mesh or shader set-up
+  resetVolumeBlend();
   if (state.volume && g && state.volume.geo === state.geo && state.volume.placement === placement && $('renderMode').value !== 'iso') {
+    // The next time was already put on the graphics card for the in-between frames: the textures swap roles
+    if (state.volume.nextGrid === g && state.volume.tex2) {
+      [state.volume.tex, state.volume.tex2] = [state.volume.tex2, state.volume.tex];
+      state.volume.nextGrid = null;
+      volumeUniforms.vol.value = state.volume.tex;
+      volumeUniforms.vol2.value = state.volume.tex2;
+      return;
+    }
+    state.volume.nextGrid = null;
     const { pz, zmin, zmax } = state.geo, tex = state.volume.tex;
     const placedByHeight = g.vkind === 'pressure' || g.vkind === 'height' || (g.vmode === 'pressure' && !!g.data[g.pressureParam]);
     const vol = resampleVolume(g.data[g.param], g.nx, g.ny, g.nz, pz, zmin, zmax, !placedByHeight, tex.image.data);
@@ -2730,7 +3040,7 @@ function syncViewControls() {
   const t = $('vcTime');
   $('vcTimePrev').disabled = t.selectedIndex <= 0;
   $('vcTimeNext').disabled = t.selectedIndex < 0 || t.selectedIndex >= t.options.length - 1;
-  $('vcStop').disabled = !anim.playing && t.selectedIndex <= 0; // already at the start
+  $('vcStop').disabled = !anim.playing && t.value === firstTime(); // already at the start
 
   const iso = state.isos[0];
   $('vcThresholdWrap').hidden = !iso;
@@ -2763,13 +3073,16 @@ function levelsText(g) {
   return `levels ${first}–${last}${step > 1 ? ` every ${step}` : ''}`;
 }
 
+// The HUD describes the loaded time: in-between frames (shown on the time line) leave it as it is, so it does not
+// change several times a second while animating
 function updateHud() {
   syncViewControls();
   const g = state.grid;
   if (!g) { $('hud').innerHTML = ''; return; }
+  if (g.shownTime) return;
   const isoTxt = state.isos.filter((i) => i.visible).map((i) => `${fmt(i.value)} ${g.unit}`).join(', ');
   $('hud').innerHTML =
-    `<b>${g.wind ? `wind (${g.wind.speed} + ${g.wind.dir})` : g.param}</b> · ${g.shownTime || g.datetime || ''}${g.shownTime ? ' (in between)' : ''}<br>` +
+    `<b>${g.wind ? `wind (${g.wind.speed} + ${g.wind.dir})` : g.param}</b> · ${g.datetime || ''}<br>` +
     `run ${g.instance || '–'} · ${levelsText(g)} · ${g.nx}×${g.ny}×${g.nz}` +
     `${g.proj ? ' · native rotated pole grid' : ''}<br>` +
     `read ${fmtCount(g.valuesRead)} values (${g.sourceSize.join('×')} × ${g.nz} levels${Object.keys(g.data).length > 1 ? ` × ${Object.keys(g.data).length} parameters` : ''})` +
@@ -3144,12 +3457,17 @@ $('renderMode').addEventListener('change', syncViewControls);
 $('volStyle').addEventListener('input', syncViewControls);
 $('vcPlay').addEventListener('click', () => (anim.playing ? stopAnimation() : startAnimation()));
 // Tape deck: ⏹ ends the animation at the first time
-const firstTime = () => $('vcTime').options[0]?.value;
+// ⏹ goes back to the first time of the animation loop (of the run, without a loop)
+function firstTime() {
+  const l = anim.loop, opts = $('vcTime').options;
+  return (l && l.instance === $('instance').value && l.count === opts.length ? opts[l.start] : opts[0])?.value;
+}
 $('vcStop').addEventListener('click', async () => {
   const playing = anim.playing;
   await showTime(firstTime());
-  if (playing) setStatus('Animation stopped, back at the first time');
+  if (playing) setStatus('Animation stopped, back at the first time of the loop');
 });
+$('vcSteps').addEventListener('change', () => updateLoadBlocks());
 const setThreshold = (value) => {
   const iso = state.isos[0];
   if (!iso || !Number.isFinite(value)) return;
@@ -3204,6 +3522,8 @@ $('clearCache').addEventListener('click', async () => {
   setStatus('Cache cleared: times are loaded from the server again');
 });
 updateLocalCacheInfo(0);
+
+$('vcTour').addEventListener('change', () => ($('vcTour').checked ? startTour() : stopTour()));
 
 $('globeOn').addEventListener('change', () => {
   if (!state.grid) return;

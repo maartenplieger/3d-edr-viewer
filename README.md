@@ -83,19 +83,36 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   loads it; ‹ › step to the previous or next time), the threshold (the first isosurface value, also the
   volume's fill threshold) with the volume density below it, how it is shown (volume filled above, below or in a band around the threshold, or
   an isosurface) and the vertical scale. They drive the same controls as the panel and stay in sync with it.
-- **Animation.** ▶ next to the time steps through all times of the run and wraps around; the menu next to it
-  sets the time per frame, and *ahead* how many next times are loaded while one is shown (1–3, default 2:
+- **Animation.** ▶ next to the time steps through the times of the run and wraps around; ⏸ pauses, ⏹ stops
+  at the first time of the loop. The loop-length menu (*all times*, or 6, 12, 24 or 48) limits the loop to that
+  many times from the time shown when ▶ is pressed (shifted back when the run ends sooner); pausing and playing
+  again keeps the loop, and the block bar dims the times outside it. The menu next to ▶ sets the time per
+  frame, and *ahead* how many next times are loaded while one is shown (1–3, default 2:
   more keeps the server busy, which matters when every new time takes seconds). Every loaded cube stays in memory
   (up to 1 GB, oldest used dropped first), so a second loop, or going back to a time, needs no request. The
   *Load* button also uses the cached times. A manual load or time change stops the animation. The sun,
   moon and stars move smoothly while animating: their time runs on from the shown time to the next one during the
-  frame (and waits there while the next time is still loading). *Appearance → In between* (default every
-  10 minutes) also shows the data interpolated between two loaded times while animating, linearly (directions
-  the shorter way round), so the motion is smoother without loading more data. Cubes are downloaded, parsed
+  frame (and waits there while the next time is still loading). *Appearance → In between* (default
+  continuous, or every 5–30 minutes) also shows the data interpolated between two loaded times while animating,
+  linearly (directions the shorter way round), so the motion is smoother without loading more data. When only
+  the volume is shown, this is done on the graphics card: the next time goes into a second 3D texture once per
+  step and every in-between frame only changes the blend, so it costs nothing on the main thread (continuous
+  then means every drawn frame). With isosurfaces, slices or streamlines the values are interpolated on the
+  CPU (every 5 minutes when continuous). Cubes are downloaded, parsed
   and averaged in two web workers (`src/cubeworker.js`), so loading the next times does not hold up the view.
-  While times are loading, a bar at the bottom of the view has a block per time of the run: filled when in
-  memory, partly filled while loading (by level requests done or bytes received), the shown time framed. It
-  fades out when nothing is loading any more.
+- **Time line.** The bar at the bottom of the view has a block per time of the run: filled when in memory,
+  partly filled while loading (by level requests done or bytes received), lightly filled when in the local
+  cache, the shown time framed. Its playhead follows the shown moment, smoothly while animating, and its label
+  gives that moment. Click or drag it to show any moment, also between two times (pauses the animation): blended
+  on the graphics card when only the volume is shown, interpolated otherwise, following *In between* (off: the
+  nearest time). The HUD in the top right describes the loaded time and only changes when that changes, so it
+  stays calm while animating.
+- **Fly around.** *Fly around* in the view bar circles the camera slowly around the data (one turn in two
+  minutes, rising and sinking a little), from a distance where all of it is in view. Dragging and zooming
+  still work while it circles; flying with the keys stops it.
+- **Frame rate.** *Appearance → Frame rate* (on by default) shows in the bottom right of the view the frames
+  drawn per second, the longest gap between two drawn frames (a stutter shows up there, orange above 50 ms) and
+  the main-thread time per frame. The view is drawn on demand, so it says *idle* when nothing moves.
 - **Local cache.** *Data → Local cache* (default up to 2 GB) keeps the loaded times of a run in the browser
   (IndexedDB, `src/framestore.js`), decoded as the viewer uses them, so they are back in a fraction of a second,
   also after a reload or on another day; the least recently used are dropped beyond the limit. *Clear* removes
@@ -123,7 +140,7 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
     averaged, as a volume filled above 50 kt with vertical scale ×10, with the sky and the earth surface on.
   - *Jet stream core on the globe – DINI (geoservices)*: the same data on the globe, only the core of the jet
     stream (filled above 93.5 kt, density 0.83, vertical scale ×4.9), with the sun, moon, stars and star names,
-    in-between frames every 10 minutes, seen from the south-east. Presets can set their own camera view
+    continuous in-between frames, seen from the south-east. Presets can set their own camera view
     (`view: { azimuth, elevation, distance }`), and switch the globe, sun and star names on or off.
   - *Jet stream – Nordic (MEPS, meteocore)*: the MEPS forecast from FMI's meteocore
     (`https://meteocore.app.meteo.fi/edr`), wind speed on 13 pressure levels (1000–50 hPa) at their height,
