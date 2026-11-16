@@ -20,7 +20,37 @@ export function sunPosition(time) {
     lat: dec / D,
     lon: lonDeg,
     ecef: [Math.cos(dec) * Math.cos(lon), Math.cos(dec) * Math.sin(lon), Math.sin(dec)],
+    gmst, // radians, for the stars
   };
+}
+
+// Earth-fixed unit vector of a direction on the sky (right ascension and declination in degrees) at sidereal time
+// gmst (radians): the stars turn with it
+export function skyEcef(raDeg, decDeg, gmst) {
+  const lon = raDeg * D - gmst, dec = decDeg * D;
+  return [Math.cos(dec) * Math.cos(lon), Math.cos(dec) * Math.sin(lon), Math.sin(dec)];
+}
+
+// Position of the moon (geocentric, about 0.3° accurate) from the low-precision formulas of the Astronomical
+// Almanac, as an Earth-fixed unit vector, with the illuminated fraction of its disc
+export function moonPosition(time) {
+  const ms = typeof time === 'string' ? Date.parse(time) : +time;
+  const d = ms / 86400000 + 2440587.5 - 2451545.0;
+  const T = d / 36525; // Julian centuries since J2000.0
+  const sd = (a, b) => Math.sin((a + b * T) * D);
+  const lambda = (218.32 + 481267.881 * T + 6.29 * sd(135.0, 477198.87) - 1.27 * sd(259.3, -413335.36) + 0.66 * sd(235.7, 890534.22)
+    + 0.21 * sd(269.9, 954397.74) - 0.19 * sd(357.5, 35999.05) - 0.11 * sd(186.5, 966404.03)) * D;
+  const beta = (5.13 * sd(93.3, 483202.02) + 0.28 * sd(228.2, 960400.89) - 0.28 * sd(318.3, 6003.15) - 0.17 * sd(217.6, -407332.21)) * D;
+  // Ecliptic → equatorial
+  const e = (23.439 - 0.00000036 * d) * D;
+  const x = Math.cos(beta) * Math.cos(lambda), y = Math.cos(beta) * Math.sin(lambda), z = Math.sin(beta);
+  const ye = y * Math.cos(e) - z * Math.sin(e), ze = y * Math.sin(e) + z * Math.cos(e);
+  const ra = Math.atan2(ye, x), dec = Math.asin(ze);
+  const sun = sunPosition(ms);
+  const ecef = skyEcef(ra / D, dec / D, sun.gmst);
+  // Illuminated fraction from the angle between sun and moon seen from the Earth
+  const elongation = Math.acos(Math.max(-1, Math.min(1, dot(ecef, sun.ecef))));
+  return { ecef, ra: ((ra / D) + 360) % 360, dec: dec / D, illuminated: (1 - Math.cos(elongation)) / 2, elongation: elongation / D };
 }
 
 // Earth-fixed unit vector of a point at lon/lat (degrees)

@@ -62,6 +62,7 @@ summary {
 
 label.stack { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; color: var(--muted); font-size: 12px; }
 label.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+label.check select.inline { width: auto; padding: 2px 4px; }
 label.slider { display: grid; grid-template-columns: 88px 1fr 44px; align-items: center; gap: 6px; margin: 6px 0; color: var(--muted); }
 output { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; font-size: 12px; }
 
@@ -114,6 +115,8 @@ button.icon { padding: 2px 7px; }
 .collection-url .collection-list { margin: 8px 0 0; }
 .collection-url .collection-list span { font-weight: normal; }
 .muted { color: var(--muted); font-size: 11px; }
+.local-cache { align-items: flex-end; }
+.local-cache .muted { padding-bottom: 7px; }
 
 details.subsection { margin-top: 10px; padding-bottom: 0; }
 details.subsection summary { text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 12px; }
@@ -180,10 +183,11 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); }
 .vc-time .vc-inline { gap: 3px; }
 .vc-time select { max-width: 150px; font-variant-numeric: tabular-nums; }
 .vc-time button { padding: 2px 8px; line-height: 1.3; }
-.vc-time button.play { margin-left: 4px; min-width: 2.2em; }
+.vc-time button.deck { width: 2.4em; padding-left: 0; padding-right: 0; text-align: center; } /* tape deck: ▶/⏸ ⏹, fixed widths */
+.vc-time button.deck.first { margin-left: 4px; }
 .vc-time button.play.active { background: var(--accent); border-color: var(--accent); color: #1a1006; }
 .view-controls select.speed { width: auto; }
-#vcAnimInfo { min-width: 5ch; font-variant-numeric: tabular-nums; }
+#vcAnimInfo { width: 5.5ch; flex: none; font-variant-numeric: tabular-nums; white-space: nowrap; } /* fixed: the controls do not move */
 .vc-threshold input[type=range] { width: 130px; }
 .vc-column { display: flex; flex-direction: column; gap: 6px; }
 .vc-check { justify-content: flex-end; padding-bottom: 4px; color: var(--text) !important; font-size: 12px !important; }
@@ -211,7 +215,33 @@ progress { width: 100%; height: 6px; accent-color: var(--accent); }
 }
 .flight-info.visible { opacity: 1; }
 .flight-info b { color: var(--text); }
-@media (max-width: 1100px) { .flight-info { bottom: 90px; } } /* the HUD moves to the bottom right there */
+@media (max-width: 1100px) { .flight-info { bottom: 90px; } }
+
+/* While times are loading: a block per time of the run, filled as it loads */
+.load-blocks {
+  position: absolute;
+  left: 50%;
+  bottom: 34px;
+  transform: translateX(-50%);
+  width: min(640px, calc(100% - 24px));
+  padding: 6px 10px 8px;
+  background: rgba(22, 28, 35, 0.86);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.6s;
+}
+.load-blocks.visible { opacity: 1; }
+.lb-label { color: var(--muted); font-size: 11px; margin-bottom: 5px; font-variant-numeric: tabular-nums; }
+.lb-row { display: flex; gap: 2px; height: 10px; }
+.lb { flex: 1; min-width: 2px; background: var(--panel-2); border-radius: 2px; overflow: hidden; position: relative; }
+.lb > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }
+.lb.done > i { opacity: 0.75; }
+.lb.stored > i { opacity: 0.3; }
+.lb.loading { animation: lb-pulse 1.2s ease-in-out infinite; }
+.lb.current { box-shadow: 0 0 0 1px var(--text); }
+@keyframes lb-pulse { 50% { background: #2c3845; } } /* the HUD moves to the bottom right there */
 
 .keys-hint {
   position: absolute;

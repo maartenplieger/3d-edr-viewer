@@ -40,12 +40,15 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - **Grid cells.** *Appearance → Grid cells* draws the cells in use: their edges on the ground, and on the
   west and north walls a line per column and per loaded level (following the actual heights in pressure
   altitude mode). With a horizontal step these are the averaged cells, on a native grid the native cells.
-- **Sun.** *Appearance → Sun at the shown time* puts the sun where it is at the shown time, seen from the centre
+- **Sun and moon.** *Appearance → Sun and moon at the shown time* puts the sun where it is at the shown time, seen from the centre
   of the data (on a rotated grid turned to grid north), from the Astronomical Almanac's low-precision formulas.
   The light on isosurfaces and the volume then comes from the sun, the sky turns blue by day with a glow around
-  the sun and twilight colours when it is low, and the stars fade out. The HUD gives its elevation and azimuth;
-  it follows the time, also while animating.
-- **Globe.** *Globe* in the view bar wraps the scene around the Earth: every point goes to its real lon/lat on a
+  the sun and twilight colours when it is low, and the stars fade out. The moon (about 0.3° accurate, shown
+  2.5× its real size) is lit from the sun's direction, so its phase is right. The HUD gives the sun's elevation
+  and azimuth and the moon's elevation and illuminated fraction; both follow the time, also while animating.
+- **Stars.** The sky has the 1630 stars of the Yale Bright Star Catalogue up to magnitude 5, where they are at the
+  shown time, with their brightness and colour. *Appearance → Star names* labels the 55 best-known ones.
+- **Globe.** *Appearance → Globe* wraps the scene around the Earth: every point goes to its real lon/lat on a
   sphere with the Earth's radius, at its height (times the vertical scale). The centre of the data stays on top,
   so the view starts like the flat one, only curved; zoom out to see the whole Earth. Slices, isosurfaces (with
   their normals), streamlines, borders, grid cells, labels and the box are placed on the globe; the volume's
@@ -84,26 +87,44 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   sets the time per frame, and *ahead* how many next times are loaded while one is shown (1–3, default 2:
   more keeps the server busy, which matters when every new time takes seconds). Every loaded cube stays in memory
   (up to 1 GB, oldest used dropped first), so a second loop, or going back to a time, needs no request. The
-  *Load* button always fetches from the server again. A manual load or time change stops the animation.
-- **Flying.** Fly through the scene with the keyboard, like a plane with inertia. <kbd>W</kbd>/<kbd>S</kbd>
-  speed up and slow down along the nose (past zero you fly backwards), <kbd>A</kbd>/<kbd>D</kbd> push sideways,
-  <kbd>Q</kbd>/<kbd>E</kbd> down/up, and the arrow keys turn and pitch, with a smooth start and stop. After you
-  let go of the keys the plane keeps its speed (the path follows the nose in a turn); brake with <kbd>S</kbd>.
-  The top speed is low, so it never goes fast; <kbd>Shift</kbd> gives 2× thrust and top speed, <kbd>Space</kbd> stops at once. In a turn the view banks and the
-  nose lifts a little, and climbing or descending tilts the nose, like a plane. While flying, the bottom right
-  shows the position (lon/lat), the height (model level, or km in pressure altitude mode), the speed and the
-  heading. Speeds follow the size of the loaded area. Using the mouse stops the flight, levels the view and
-  moves the orbit point to the data ahead. Keys are ignored while a panel field has the focus; click the view
-  to fly again. *Appearance → Sky with horizon and stars* adds a reference while flying: a sky dome with the
-  true horizon and stars, infinitely far away, so turning, pitching and banking show against it. *Earth surface
-  around the data* continues the base map over about seven times the data area, with faint degree lines, as a
-  reference for height and motion when flying low. The preset switches both on.
+  *Load* button also uses the cached times. A manual load or time change stops the animation. The sun,
+  moon and stars move smoothly while animating: their time runs on from the shown time to the next one during the
+  frame (and waits there while the next time is still loading). *Appearance → In between* (default every
+  10 minutes) also shows the data interpolated between two loaded times while animating, linearly (directions
+  the shorter way round), so the motion is smoother without loading more data. Cubes are downloaded, parsed
+  and averaged in two web workers (`src/cubeworker.js`), so loading the next times does not hold up the view.
+  While times are loading, a bar at the bottom of the view has a block per time of the run: filled when in
+  memory, partly filled while loading (by level requests done or bytes received), the shown time framed. It
+  fades out when nothing is loading any more.
+- **Local cache.** *Data → Local cache* (default up to 2 GB) keeps the loaded times of a run in the browser
+  (IndexedDB, `src/framestore.js`), decoded as the viewer uses them, so they are back in a fraction of a second,
+  also after a reload or on another day; the least recently used are dropped beyond the limit. *Clear* removes
+  them all, and the times in memory, so they are loaded from the server again (*Load* uses the caches). Only times of a run (an instance) are kept, as their data does not change. In the block bar they show
+  as lightly filled blocks. Besides, the browser's own HTTP cache keeps geoservices responses for 10 hours.
+- **Flying.** Fly through the scene with the keyboard, like a plane: <kbd>W</kbd>/<kbd>S</kbd> throttle (S slows
+  down, and past zero flies backwards, up to the same top speed), <kbd>↑</kbd>/<kbd>↓</kbd> pitch the nose up and down (hold <kbd>↑</kbd> for a loop, about 15 s),
+  <kbd>←</kbd>/<kbd>→</kbd> roll, <kbd>A</kbd>/<kbd>D</kbd> rudder, <kbd>R</kbd> levels out (wings level, nose to
+  the horizon, keeping the heading), <kbd>Space</kbd> stops and <kbd>Shift</kbd> gives 2× throttle and top speed.
+  While flying the camera has its own attitude, so it can roll, fly upside down and loop. A banked plane turns by
+  itself, more at speed, as in a coordinated turn; rotation rates build up and fade smoothly, and the speed is
+  kept until you brake. The top speed is low (a fraction of the area per second), so it never goes fast. The
+  bottom right shows the position (lon/lat), the height (model level, or km), the speed, the heading, and the
+  pitch and bank (upside down when the bank is over 90°). On the globe, up is the local vertical. Using the mouse
+  hands back to orbiting: the view levels and the orbit point moves to the data ahead. Keys are ignored while a
+  panel field has the focus; click the view to fly again. *Appearance → Sky with horizon and stars* adds a
+  reference while flying: a sky dome with the true horizon and stars, infinitely far away. *Earth surface around
+  the data* continues the base map, as a reference for height and motion when flying low. The preset switches
+  both on.
 - **Presets.** The *Presets* section applies a complete view in one click; the first one is also the start
   view. Presets are defined in the `PRESETS` list in `src/main.js`.
   - *Jet stream – DINI (uwcw-ha-det-dini-5p5km, geoservices)*: KNMI UWCW HARMONIE DINI from
     `geoservices.knmi.nl`, on the model's native rotated pole grid (`crs=native`, no resampling to lon/lat),
     wind speed on the full model domain, every 4th model level from level 4 (8 levels per request), 4×4
     averaged, as a volume filled above 50 kt with vertical scale ×10, with the sky and the earth surface on.
+  - *Jet stream core on the globe – DINI (geoservices)*: the same data on the globe, only the core of the jet
+    stream (filled above 93.5 kt, density 0.83, vertical scale ×4.9), with the sun, moon, stars and star names,
+    in-between frames every 10 minutes, seen from the south-east. Presets can set their own camera view
+    (`view: { azimuth, elevation, distance }`), and switch the globe, sun and star names on or off.
   - *Jet stream – Nordic (MEPS, meteocore)*: the MEPS forecast from FMI's meteocore
     (`https://meteocore.app.meteo.fi/edr`), wind speed on 13 pressure levels (1000–50 hPa) at their height,
     filled above 25 m/s (≈ 50 kt) with vertical scale ×15. The full domain at the native 2.5 km grid is over
@@ -161,7 +182,10 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - `src/streamlines.js` – particles with trails moving with the derived wind
 - `src/volume.js` – volume resampling, 3D texture and ray-marching shader
 - `src/rotpole.js` – rotated pole CRS from WKT, rotated ↔ lon/lat
-- `src/sun.js` – position of the sun at a time
+- `src/cubeworker.js` – loads cubes off the main thread
+- `src/framestore.js` – the local cache of loaded cubes (IndexedDB)
+- `src/sun.js` – positions of the sun, the moon and the stars at a time
+- `src/stars.js` – the stars up to magnitude 5 from the Yale Bright Star Catalogue (generated)
 - `src/globe.js` – the globe projection: flat scene ↔ sphere
 - `src/colormaps.js` – colour maps, shader texture and colour bar
 - `src/main.js` – scene, UI wiring, slices, labels, picking

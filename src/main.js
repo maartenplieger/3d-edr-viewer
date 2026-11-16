@@ -2,12 +2,14 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as topojson from 'topojson-client';
 import { fetchJSON, parseTemporalValues, parseCubeUrl, toIso, loadCube, MAX_POINTS_PER_LEVEL } from './edr.js';
+import { frameStoreUsage, clearFrames, evictFrames } from './framestore.js';
 import { marchingCubes } from './isosurface.js';
 import { COLORMAP_NAMES, makeColormapTexture, drawColorbar, hexToRgb } from './colormaps.js';
 import { resampleVolume, createVolumeMaterial, createVolumeTexture, updateVolumeCamera } from './volume.js';
 import { nativeCubeCrs, bboxToRot, bboxToGeo } from './rotpole.js';
 import { Streamlines } from './streamlines.js';
-import { sunPosition, enuFrame, dot } from './sun.js';
+import { sunPosition, moonPosition, skyEcef, enuFrame, dot } from './sun.js';
+import { STARS, STAR_NAMES } from './stars.js';
 import { makeGlobe, EARTH_RADIUS } from './globe.js';
 
 // No instance or time: runs expire on the server, so startup takes the latest run and its first time
@@ -89,6 +91,33 @@ const PRESETS = [
     vscale: 10,
     sky: true,
     earth: true,
+    globe: false,
+    sun: false,
+    starNames: false,
+  },
+  {
+    name: 'Jet stream core on the globe – DINI (geoservices)',
+    description: 'As the DINI preset, on the globe at night: only the core of the jet stream (volume filled above 93.5 kt, coloured over the filled range), with the sun, moon and stars at the shown time and the star names, vertical scale ×4.9',
+    collectionUrl: DEFAULT_COLLECTION,
+    crs: 'native',
+    bbox: 'full',
+    stride: '4',
+    levelStep: 4,
+    levelsPerRequest: 8,
+    parameter: 'wind_speed_ml',
+    levels: [4, 90],
+    renderMode: 'volume',
+    volStyle: '0',
+    threshold: 93.5,
+    density: 0.83,
+    vscale: 4.9,
+    sky: true,
+    earth: true,
+    globe: true,
+    sun: true,
+    starNames: true,
+    tween: 10,
+    view: { azimuth: 150, elevation: 30, distance: 0.95 }, // from the south-east, above the Mediterranean
   },
   {
     name: 'Jet stream – Nordic (MEPS, meteocore)',
@@ -109,6 +138,9 @@ const PRESETS = [
     vscale: 15,
     sky: true,
     earth: true,
+    globe: false,
+    sun: false,
+    starNames: false,
   },
 ];
 const KM_SCALE = 5; // world units per km of altitude in pressure-altitude mode
@@ -151,7 +183,7 @@ scene.add(hemiLight);
 // behind everything else, and not affected by the depth haze.
 const skyGroup = new THREE.Group();
 skyGroup.visible = false;
-let skyDomeMaterial, starMaterial, lowerStarMaterial; // set below; the sun and the globe change them
+let skyDomeMaterial; // set below; the sun and the globe change it
 {
   const dome = new THREE.Mesh(
     new THREE.SphereGeometry(1, 64, 32),
@@ -193,37 +225,7 @@ let skyDomeMaterial, starMaterial, lowerStarMaterial; // set below; the sun and 
   dome.renderOrder = -20;
   dome.frustumCulled = false;
 
-  // Stars in a fixed pattern (seeded), only above the horizon, brighter ones rarer
-  let seed = 12345;
-  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  const N = 2500, pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
-  for (let n = 0; n < N; n++) {
-    const z = 0.03 + 0.97 * Math.sqrt(rand()); // more towards the zenith than uniform, but also low stars
-    const r = Math.sqrt(1 - z * z), a = rand() * Math.PI * 2;
-    pos.set([r * Math.cos(a) * 0.98, r * Math.sin(a) * 0.98, z * 0.98], n * 3);
-    const b = 0.35 + 0.65 * rand() ** 3;
-    const tint = rand(); // a little blue or yellow
-    col.set([b * (0.9 + 0.1 * tint), b * 0.95, b * (1.0 - 0.1 * tint)], n * 3);
-  }
-  const starGeom = new THREE.BufferGeometry();
-  starGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  starGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  const stars = new THREE.Points(starGeom, (starMaterial = new THREE.PointsMaterial({
-    size: 1.8, sizeAttenuation: false, vertexColors: true, depthWrite: false, depthTest: false, fog: false, transparent: true,
-  })));
-  stars.renderOrder = -19;
-  stars.frustumCulled = false;
-  // The same stars mirrored below the horizon, only shown from space above the globe
-  const lowerPos = Float32Array.from(pos, (v, n) => (n % 3 === 2 ? -v : v));
-  const lowerGeom = new THREE.BufferGeometry();
-  lowerGeom.setAttribute('position', new THREE.BufferAttribute(lowerPos, 3));
-  lowerGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  const lowerStars = new THREE.Points(lowerGeom, (lowerStarMaterial = new THREE.PointsMaterial({
-    size: 1.8, sizeAttenuation: false, vertexColors: true, depthWrite: false, depthTest: false, fog: false, transparent: true, opacity: 0,
-  })));
-  lowerStars.renderOrder = -19;
-  lowerStars.frustumCulled = false;
-  skyGroup.add(dome, stars, lowerStars);
+  skyGroup.add(dome);
 }
 scene.add(skyGroup);
 const sun = new THREE.DirectionalLight(0xffffff, 1.8);
@@ -249,7 +251,7 @@ sunGroup.visible = false;
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   const disc = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: tex, depthTest: false, depthWrite: false, fog: false, transparent: true, blending: THREE.AdditiveBlending,
+    map: tex, depthWrite: false, fog: false, transparent: true, blending: THREE.AdditiveBlending, // depth-tested: the globe hides it
   }));
   disc.renderOrder = -18; // after the sky and the stars, before everything else
   disc.frustumCulled = false;
@@ -257,6 +259,129 @@ sunGroup.visible = false;
 }
 scene.add(sunGroup);
 const DEFAULT_LIGHT = new THREE.Vector3(-1, -1.5, 3);
+
+// The stars of the Yale Bright Star Catalogue up to magnitude 5, where they are at the shown time (with the sky).
+// Like the sky they are infinitely far away (centred on the camera), but not turned with the local horizon:
+// their directions are in the scene's frame. Below the horizon they are hidden, except far out in space; by
+// day they fade out. Size and brightness follow the magnitude, the colour the star's temperature.
+const celestialGroup = new THREE.Group();
+celestialGroup.visible = false;
+const starUniforms = { up: { value: new THREE.Vector3(0, 0, 1) }, space: { value: 0 }, fade: { value: 1 }, pixelRatio: { value: 1 } };
+const starNameLabels = [];
+
+// A small text sprite on the sky: constant angular size, as everything in the camera-centred groups
+function makeSkyLabel(text) {
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  const fs = 36;
+  ctx.font = `${fs}px system-ui, sans-serif`;
+  c.width = Math.ceil(ctx.measureText(text).width) + 8;
+  c.height = fs + 10;
+  ctx.font = `${fs}px system-ui, sans-serif`;
+  ctx.fillStyle = '#b8c8da';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 4, c.height / 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false, transparent: true, fog: false, opacity: 0.8 }));
+  const h = 0.011; // about 0.6° high
+  sprite.scale.set((h * c.width) / c.height, h, 1);
+  sprite.center.set(-0.08, 0.5); // just right of the star
+  sprite.renderOrder = -18;
+  return sprite;
+}
+
+{
+  const n = STARS.length / 4;
+  const size = new Float32Array(n), colour = new Float32Array(n * 3);
+  // Approximate colour of a star of temperature T (K): red below ~3500 K, white near 6500 K, blue above
+  const starColour = (t) => {
+    const k = Math.min(Math.max(t, 2500), 30000);
+    const r = k < 6600 ? 1 : Math.max(0.62, 1.29 * (k / 6600) ** -0.133);
+    const g = k < 6600 ? Math.min(1, 0.39 * Math.log(k / 100) - 0.63) : Math.max(0.72, 1.13 * (k / 6600) ** -0.0755);
+    const b = k >= 6600 ? 1 : Math.min(1, 0.54 * Math.log(k / 100 - 10) - 1.2);
+    return [r, Math.max(0, g), Math.max(0, b)];
+  };
+  for (let i = 0; i < n; i++) {
+    const mag = STARS[i * 4 + 2];
+    size[i] = Math.min(6, Math.max(1.4, 4.6 - 0.75 * mag)); // pixels: Sirius large, magnitude 5 small
+    const c = starColour(STARS[i * 4 + 3] * 100), b = Math.min(1, Math.max(0.3, 1.25 - 0.17 * mag));
+    colour.set([c[0] * b, c[1] * b, c[2] * b], i * 3);
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3)); // set by updateStars
+  geom.setAttribute('size', new THREE.BufferAttribute(size, 1));
+  geom.setAttribute('colour', new THREE.BufferAttribute(colour, 3));
+  const stars = new THREE.Points(geom, new THREE.ShaderMaterial({
+    uniforms: starUniforms,
+    transparent: true, // drawn after the opaque scene, depth-tested so the globe hides the stars behind it
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: /* glsl */ `
+      attribute float size;
+      attribute vec3 colour;
+      uniform vec3 up;
+      uniform float space, fade, pixelRatio;
+      varying vec3 vColour;
+      varying float vAlpha;
+      void main() {
+        // Above the local horizon, or anywhere far out in space; fading out by day
+        float above = max(space, smoothstep(-0.02, 0.03, dot(normalize(position), up)));
+        vAlpha = above * max(fade, space);
+        vColour = colour;
+        gl_PointSize = size * pixelRatio;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      varying vec3 vColour;
+      varying float vAlpha;
+      void main() {
+        float r = length(gl_PointCoord - 0.5) * 2.0; // round, soft-edged points
+        float a = vAlpha * (1.0 - smoothstep(0.4, 1.0, r));
+        if (a < 0.01) discard;
+        gl_FragColor = vec4(vColour * a, a);
+      }`,
+  }));
+  stars.renderOrder = -19;
+  stars.frustumCulled = false;
+  celestialGroup.add(stars);
+  // Names of the well-known stars (Star names)
+  for (const [i, name] of STAR_NAMES) {
+    const label = makeSkyLabel(name);
+    label.userData.star = i;
+    starNameLabels.push(label);
+    celestialGroup.add(label);
+  }
+}
+scene.add(celestialGroup);
+
+// The moon (with the sun): a small sphere lit from the direction of the sun, so its phase is right. Shown about
+// 2.5× its real size (0.5°), so it can be seen.
+const moonMaterial = new THREE.ShaderMaterial({
+  uniforms: { sunDir: { value: new THREE.Vector3(0, 0, 1) }, night: { value: 1 } },
+  transparent: true,
+  depthWrite: false,
+  vertexShader: /* glsl */ `
+    varying vec3 vNormal;
+    void main() {
+      vNormal = normal; // the moon is not rotated: object normals are scene directions
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */ `
+    uniform vec3 sunDir;
+    uniform float night;
+    varying vec3 vNormal;
+    void main() {
+      float lit = smoothstep(-0.04, 0.06, dot(normalize(vNormal), normalize(sunDir)));
+      vec3 c = mix(vec3(0.035, 0.04, 0.05), vec3(0.93, 0.91, 0.86), lit); // the dark part faintly visible (earthshine)
+      gl_FragColor = vec4(c, max(lit, night)); // by day the dark part is the blue sky
+    }`,
+});
+const moon = new THREE.Mesh(new THREE.SphereGeometry(0.0115, 32, 16), moonMaterial);
+moon.renderOrder = -17;
+moon.frustumCulled = false;
+sunGroup.add(moon);
+const moonState = { dir: null, elevation: null, illuminated: null };
 const sunState = { dir: null, elevation: null, azimuth: null };
 const fill = new THREE.DirectionalLight(0xffffff, 0.5);
 fill.position.set(1, 1.5, -1);
@@ -372,77 +497,74 @@ function updateHaze() {
 }
 
 // ---------------------------------------------------------------- keyboard flight
-// Flies like a plane, with inertia: W/S speed up/slow down along the nose (S past zero flies backwards), A/D
-// and Q/E push sideways and down/up, the arrow keys turn and pitch. After releasing the keys the plane keeps
-// cruising (the path follows the nose when turning); sideways and vertical drift and turning fade out.
-// Never fast: the top speed is low. Shift: 2× thrust and top speed. Space: stop everything at once.
-// Camera and orbit target move together, so mouse orbiting keeps working around the point ahead.
+// Flies like a plane. While flying the camera has its own attitude, so it can roll, fly upside down and loop;
+// the mouse orbit controls are off meanwhile (they would level the view every frame).
+//   W/S  throttle (S slows down, past zero backwards)  ↑/↓  pitch: nose up / down (hold ↑ for a loop)
+//   ←/→  roll                                   A/D  rudder (yaw)
+//   R    level out: wings level, nose to the horizon, keeping the heading
+//   Space stop                                  Shift 2× throttle and top speed
+// A banked plane turns by itself, more at speed (a coordinated turn). Rotation rates build up and fade
+// smoothly. The mouse hands back to orbiting: the view levels and the orbit point goes to the data ahead.
 
 const flyKeys = new Set();
 const FLY_CODES = new Set([
-  'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'Space',
+  'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyR', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'Space',
 ]);
+const deg = THREE.MathUtils.degToRad;
 const FLY = {
   maxSpeed: 0.15, // fraction of the scene extent per second, ×2 with Shift: never fast
   accel: 0.12, // same unit, per second
-  driftDrag: 1.2, // per second: how fast sideways/vertical motion fades without a key
-  forwardDrag: 0, // per second: the forward speed is kept until you brake (S) or stop (Space)
-  maxTurn: THREE.MathUtils.degToRad(25), // per second: calm turns
-  turnAccel: THREE.MathUtils.degToRad(50), // per second²: a short tap is a small correction
-  turnDrag: 3, // per second: turning fades quickly but smoothly after releasing a key
+  maxPitch: deg(25), // per second: gentle, a full loop in about 15 s
+  maxRoll: deg(40), // per second
+  maxYaw: deg(20), // per second
+  response: 2, // per second: how fast the rotation rates follow the keys, and fade after them (a tap is a small correction)
+  turnRate: deg(25), // per second: the coordinated turn at 90° bank and full speed
+  levelRate: 1.5, // per second, while R is held
 };
-const flight = { forward: 0, side: 0, vertical: 0, yaw: 0, pitch: 0 }; // speeds: world units/s and rad/s
+// active: the plane has the camera; speed in scene units/s; pitch, roll, yaw: rates in rad/s
+const flight = { active: false, speed: 0, pitch: 0, roll: 0, yaw: 0, q: new THREE.Quaternion(), targetDistance: 1 };
 const flyClock = new THREE.Clock();
-const flyTmp = { dir: new THREE.Vector3(), right: new THREE.Vector3(), move: new THREE.Vector3(), up: new THREE.Vector3(0, 0, 1) };
-
-const stopFlight = () => Object.keys(flight).forEach((key) => (flight[key] = 0));
-
-// Attitude, like a plane: bank into a turn (and lift the nose a little, as a turning plane pulls up), nose up
-// when climbing and down when descending. Only the view rotates; the flight path is not changed by it.
-const ATTITUDE = {
-  maxBank: THREE.MathUtils.degToRad(35),
-  maxNose: THREE.MathUtils.degToRad(10),
-  turnNose: 0.25, // nose up per radian of bank
-  response: 3, // per second: how fast the attitude follows the turn and climb
+const flyTmp = {
+  fwd: new THREE.Vector3(), right: new THREE.Vector3(), bodyUp: new THREE.Vector3(), up: new THREE.Vector3(),
+  q: new THREE.Quaternion(), level: new THREE.Quaternion(), euler: new THREE.Euler(0, 0, 0, 'XYZ'), m: new THREE.Matrix4(),
+  origin: new THREE.Vector3(), move: new THREE.Vector3(),
 };
-const attitude = { bank: 0, nose: 0 };
+const flightMoving = () => flight.speed !== 0 || flight.pitch !== 0 || flight.roll !== 0 || flight.yaw !== 0;
+const stopFlight = () => { flight.speed = flight.pitch = flight.roll = flight.yaw = 0; };
 
-// Hand over from flying to the mouse: as soon as an orbit, pan or zoom starts, stop the flight, level the view
-// and move the orbit point to where the line of sight passes closest to the centre of the data. After flying,
-// the orbit point would otherwise still be at the old distance, often far beyond the data, and the camera
-// would swing around it in big arcs while still drifting.
-const handoverTmp = { dir: new THREE.Vector3(), center: new THREE.Vector3() };
-controls.addEventListener('start', () => {
-  const wasFlying = Object.values(flight).some((v) => v !== 0) || attitude.bank !== 0 || attitude.nose !== 0;
-  stopFlight();
-  attitude.bank = attitude.nose = 0;
-  if (!wasFlying || !state.geo) return;
-  const { ext } = state.geo;
-  const { dir, center } = handoverTmp;
-  dir.subVectors(controls.target, camera.position).normalize();
-  dataBounds(tmpBox).getCenter(center);
-  // Distance along the view to the point closest to the data centre; a fixed distance when the data is behind
-  const along = center.sub(camera.position).dot(dir);
-  const distance = along > ext * 0.02 ? along : ext * 0.3;
-  controls.target.copy(camera.position).addScaledVector(dir, distance);
-});
-
-function applyAttitude(dt) {
-  const max = state.geo ? state.geo.ext * FLY.maxSpeed : 1;
-  // More bank at speed, but some while turning on the spot too, so the turn is felt
-  const speedFactor = 0.4 + 0.6 * Math.min(1, Math.abs(flight.forward) / max);
-  const bank = THREE.MathUtils.clamp((flight.yaw / FLY.maxTurn) * ATTITUDE.maxBank * speedFactor, -ATTITUDE.maxBank, ATTITUDE.maxBank);
-  const climb = THREE.MathUtils.clamp(flight.vertical / max, -1, 1) * ATTITUDE.maxNose;
-  const nose = THREE.MathUtils.clamp(climb + Math.abs(bank) * ATTITUDE.turnNose, -ATTITUDE.maxNose, ATTITUDE.maxNose);
-  const f = 1 - Math.exp(-ATTITUDE.response * dt);
-  attitude.bank += (bank - attitude.bank) * f;
-  attitude.nose += (nose - attitude.nose) * f;
-  if (Math.abs(attitude.bank) < 1e-5 && Math.abs(attitude.nose) < 1e-5) return;
-  // After OrbitControls aimed the camera at the target this frame: roll about the view axis, then pitch the nose
-  camera.rotateZ(attitude.bank); // positive: left wing down, for a left turn
-  camera.rotateX(attitude.nose);
-  camera.updateMatrixWorld();
+// The local vertical at the camera: +z, on the globe away from the Earth's centre
+function localUp(out) {
+  if (!globe) return out.set(0, 0, 1);
+  return out.copy(camera.position).sub(skyTmp.centre.fromArray(globe.centre)).normalize();
 }
+
+function startFlight() {
+  if (flight.active || !state.geo) return;
+  flight.active = true;
+  controls.enabled = false;
+  flight.q.copy(camera.quaternion);
+  flight.targetDistance = Math.max(camera.position.distanceTo(controls.target), state.geo.ext * 0.05);
+}
+
+// Back to the mouse: the orbit point goes to where the line of sight passes closest to the centre of the data
+// (after flying it would otherwise be far beyond it), and the orbit controls take over, which levels the view
+const handoverTmp = { dir: new THREE.Vector3(), center: new THREE.Vector3() };
+function endFlight() {
+  if (!flight.active) return;
+  stopFlight();
+  flight.active = false;
+  const { dir, center } = handoverTmp;
+  dir.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  dataBounds(tmpBox).getCenter(center);
+  const along = center.sub(camera.position).dot(dir);
+  const distance = along > state.geo.ext * 0.02 ? along : state.geo.ext * 0.3;
+  controls.target.copy(camera.position).addScaledVector(dir, distance);
+  controls.enabled = true;
+  requestRender();
+}
+// Capture phase: before OrbitControls sees the event, so the same drag or wheel already orbits
+for (const type of ['pointerdown', 'wheel']) canvas.addEventListener(type, () => endFlight(), { capture: true, passive: true });
+
 const isTyping = (el) => el && (el.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName));
 window.addEventListener('keydown', (e) => {
   if (!FLY_CODES.has(e.code) || isTyping(document.activeElement) || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -452,6 +574,7 @@ window.addEventListener('keydown', (e) => {
     stopFlight();
   } else {
     flyKeys.add(e.code);
+    if (!e.code.startsWith('Shift')) startFlight();
   }
   e.preventDefault(); // arrow keys and space would scroll the panel
 });
@@ -460,62 +583,59 @@ window.addEventListener('blur', () => flyKeys.clear());
 // Clicking the view takes the focus from panel fields, so the flight keys work right away
 canvas.addEventListener('pointerdown', () => { if (isTyping(document.activeElement)) document.activeElement.blur(); });
 
-// Moves value towards a target speed with acceleration a, or lets it fade with drag when there is no input
-function steer(value, input, max, a, drag, dt) {
-  if (input) return THREE.MathUtils.clamp(value + input * a * dt, -max, max);
-  return value * Math.exp(-drag * dt);
-}
-
+// One step of the plane: throttle, rotation rates, coordinated turn, levelling, then move along the nose
 function fly(dt) {
-  if (!state.geo) return;
+  if (!flight.active || !state.geo) return;
   const k = (code) => (flyKeys.has(code) ? 1 : 0);
-  const moving = Object.values(flight).some((v) => Math.abs(v) > 1e-9);
-  if (!moving && !flyKeys.size) return;
-
+  if (!flyKeys.size && !flightMoving()) return;
   const boost = k('ShiftLeft') || k('ShiftRight') ? 2 : 1;
   const ext = state.geo.ext, max = ext * FLY.maxSpeed * boost, a = ext * FLY.accel * boost;
-  const forwardInput = k('KeyW') - k('KeyS');
-  // Speed up or slow down along the nose; without input the speed is kept
-  flight.forward = forwardInput
-    ? THREE.MathUtils.clamp(flight.forward + forwardInput * a * dt, -max, max)
-    : flight.forward * Math.exp(-FLY.forwardDrag * dt);
-  flight.side = steer(flight.side, k('KeyD') - k('KeyA'), max, a, FLY.driftDrag, dt);
-  flight.vertical = steer(flight.vertical, k('KeyE') - k('KeyQ'), max, a, FLY.driftDrag, dt);
-  flight.yaw = steer(flight.yaw, k('ArrowLeft') - k('ArrowRight'), FLY.maxTurn, FLY.turnAccel, FLY.turnDrag, dt);
-  flight.pitch = steer(flight.pitch, k('ArrowUp') - k('ArrowDown'), FLY.maxTurn, FLY.turnAccel, FLY.turnDrag, dt);
-  for (const key of Object.keys(flight)) if (Math.abs(flight[key]) < (key === 'yaw' || key === 'pitch' ? 1e-4 : ext * 1e-5)) flight[key] = 0;
+  const throttle = k('KeyW') - k('KeyS');
+  // Past zero the plane flies backwards, up to the same top speed
+  if (throttle) flight.speed = THREE.MathUtils.clamp(flight.speed + throttle * a * dt, -max, max);
+  else if (Math.abs(flight.speed) > max) flight.speed = Math.sign(flight.speed) * (max + (Math.abs(flight.speed) - max) * Math.exp(-dt)); // after Shift: back to the top speed
+  // Rates follow the keys smoothly, and fade without them
+  const f = 1 - Math.exp(-FLY.response * dt);
+  flight.pitch += ((k('ArrowUp') - k('ArrowDown')) * FLY.maxPitch - flight.pitch) * f;
+  flight.roll += ((k('ArrowLeft') - k('ArrowRight')) * FLY.maxRoll - flight.roll) * f;
+  flight.yaw += ((k('KeyA') - k('KeyD')) * FLY.maxYaw - flight.yaw) * f;
+  for (const key of ['pitch', 'roll', 'yaw']) if (Math.abs(flight[key]) < 1e-4) flight[key] = 0;
 
-  const { dir, right, move, up } = flyTmp;
-  const offset = move.subVectors(controls.target, camera.position); // camera → target, kept while flying
-  let distance = offset.length();
-  if (distance < 1e-6) distance = ext * 0.1;
-  dir.copy(offset).normalize();
-
-  // Turn about the vertical axis, pitch about the camera's right axis (not past straight up/down)
-  if (flight.yaw) dir.applyAxisAngle(up, flight.yaw * dt);
-  right.crossVectors(dir, up);
-  if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
-  right.normalize();
-  if (flight.pitch) {
-    const pitched = dir.clone().applyAxisAngle(right, flight.pitch * dt);
-    if (Math.abs(pitched.z) < 0.995) dir.copy(pitched);
-    else flight.pitch = 0;
+  const { fwd, right, up, q, level, euler, m, origin } = flyTmp;
+  const att = flight.q;
+  // Body rotations, about the camera's own axes: x pitch (nose up), y yaw (nose left), z roll (left wing down)
+  att.multiply(q.setFromEuler(euler.set(flight.pitch * dt, flight.yaw * dt, flight.roll * dt)));
+  // Coordinated turn: a banked plane turns towards the lower wing, more at speed; not when stopped, and the
+  // other way when flying backwards, like a car reversing
+  localUp(up);
+  right.set(1, 0, 0).applyQuaternion(att);
+  const sinBank = -right.dot(up); // > 0: right wing down
+  const turn = FLY.turnRate * sinBank * THREE.MathUtils.clamp(flight.speed / (ext * FLY.maxSpeed), -1, 1);
+  if (turn) att.premultiply(q.setFromAxisAngle(up, -turn * dt));
+  // R: level out, wings level and nose to the horizon, keeping the heading
+  if (k('KeyR')) {
+    fwd.set(0, 0, -1).applyQuaternion(att);
+    fwd.addScaledVector(up, -fwd.dot(up)); // the heading in the horizontal plane
+    if (fwd.lengthSq() < 1e-6) {
+      // Straight up or down: level out towards where the top of the plane points
+      fwd.set(0, 1, 0).applyQuaternion(att);
+      fwd.addScaledVector(up, -fwd.dot(up));
+    }
+    level.setFromRotationMatrix(m.lookAt(origin.set(0, 0, 0), fwd.normalize(), up));
+    att.slerp(level, 1 - Math.exp(-FLY.levelRate * dt));
   }
-
-  // The forward motion follows the nose, so the path curves with a turn
-  move.set(0, 0, 0)
-    .addScaledVector(dir, flight.forward)
-    .addScaledVector(right, flight.side)
-    .addScaledVector(up, flight.vertical);
-  camera.position.addScaledVector(move, dt);
-  controls.target.copy(camera.position).addScaledVector(dir, distance);
+  att.normalize();
+  camera.quaternion.copy(att);
+  fwd.set(0, 0, -1).applyQuaternion(att);
+  camera.position.addScaledVector(fwd, flight.speed * dt);
+  controls.target.copy(camera.position).addScaledVector(fwd, flight.targetDistance); // for when the mouse takes over
 }
 
 // Position, height, speed and heading while flying, at the bottom right of the view
 let flightInfoAt = 0, flightIdleSince = 0;
 function updateFlightInfo(now) {
   const el = $('flightInfo');
-  const moving = Object.values(flight).some((v) => v !== 0);
+  const moving = flight.active && (flyKeys.size > 0 || flightMoving());
   if (moving) flightIdleSince = 0;
   else if (!flightIdleSince) flightIdleSince = now;
   const show = !!state.geo && (moving || now - flightIdleSince < 1500);
@@ -541,11 +661,16 @@ function updateFlightInfo(now) {
     const level = g.levels[0] + f * step;
     height = level < g.levels[0] ? `above level ${g.levels[0]}` : level > g.levels.at(-1) ? `below level ${g.levels.at(-1)}` : `level ${fmt(level, 1)}`;
   }
-  const dir = flyTmp.move.subVectors(controls.target, p).normalize();
-  const heading = (THREE.MathUtils.radToDeg(Math.atan2(dir.x, dir.y)) + 360) % 360;
-  const speed = Math.hypot(flight.forward, flight.side, flight.vertical); // scene units are km horizontally
+  // Attitude of the plane: heading, pitch and bank (±180° upside down), from its axes and the local vertical
+  const up = localUp(flyTmp.up), fwd = flyTmp.fwd.set(0, 0, -1).applyQuaternion(camera.quaternion);
+  const right = flyTmp.right.set(1, 0, 0).applyQuaternion(camera.quaternion), bodyUp = flyTmp.bodyUp.set(0, 1, 0).applyQuaternion(camera.quaternion);
+  const heading = (THREE.MathUtils.radToDeg(Math.atan2(fwd.x, fwd.y)) + 360) % 360;
+  const pitch = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(fwd.dot(up), -1, 1)));
+  const bank = THREE.MathUtils.radToDeg(Math.atan2(-right.dot(up), bodyUp.dot(up)));
+  const speed = flight.speed; // scene units are km horizontally
   el.innerHTML = `${fmt(Math.abs(lat), 3)}°${lat >= 0 ? 'N' : 'S'} ${fmt(Math.abs(lon), 3)}°${lon >= 0 ? 'E' : 'W'} · ${height}<br>` +
-    `speed <b>${fmt(speed, speed < 10 ? 2 : 1)} km/s</b> · heading ${fmt(heading, 0)}°${g.proj ? ' (grid)' : ''}`;
+    `speed <b>${fmt(Math.abs(speed), Math.abs(speed) < 10 ? 2 : 1)} km/s</b>${speed < 0 ? ' backwards' : ''} · heading ${fmt(heading, 0)}°${g.proj ? ' (grid)' : ''}<br>` +
+    `pitch ${fmt(pitch, 0)}° · bank ${fmt(bank, 0)}°${Math.abs(bank) > 90 ? ' (upside down)' : ''}`;
 }
 
 // On the globe the camera can go from near the data to far out in space: the far plane must stay beyond the
@@ -562,24 +687,52 @@ function fitClipPlanes() {
 }
 
 // On the globe the sky's horizon follows the local vertical at the camera, and fades to black space with stars all
-// around as the camera gets far above the Earth. Flat: the horizon is horizontal, as before.
-const skyTmp = { up: new THREE.Vector3(), z: new THREE.Vector3(0, 0, 1), q: new THREE.Quaternion(), sun: new THREE.Vector3(), centre: new THREE.Vector3() };
-function orientSky() {
-  const u = skyDomeMaterial.uniforms, daylight = u.daylight.value;
+// around as the camera gets far above the Earth. Flat: the horizon is horizontal, as before. The stars, sun and
+// moon are not turned with it (they are in the scene's frame); they are hidden below the local horizon.
+const skyTmp = { up: new THREE.Vector3(), z: new THREE.Vector3(0, 0, 1), q: new THREE.Quaternion(), sun: new THREE.Vector3(), centre: new THREE.Vector3(), p: new THREE.Vector3() };
+function updateSkyObjects() {
+  const u = skyDomeMaterial.uniforms;
   let space = 0;
   if (globe) {
-    skyTmp.up.copy(camera.position).sub(new THREE.Vector3(...globe.centre));
+    skyTmp.up.copy(camera.position).sub(skyTmp.centre.fromArray(globe.centre));
     const altitude = skyTmp.up.length() - EARTH_RADIUS;
     space = THREE.MathUtils.smoothstep(altitude, EARTH_RADIUS * 0.05, EARTH_RADIUS * 0.6);
-    skyGroup.quaternion.setFromUnitVectors(skyTmp.z, skyTmp.up.normalize());
+    skyTmp.up.normalize();
   } else {
-    skyGroup.quaternion.identity();
+    skyTmp.up.set(0, 0, 1);
   }
-  u.space.value = space;
-  // The sun direction in the sky's own (rotated) coordinates
-  if (sunState.dir) u.sunDir.value.copy(sunState.dir).applyQuaternion(skyTmp.q.copy(skyGroup.quaternion).invert());
-  starMaterial.opacity = Math.max(1 - daylight, space);
-  lowerStarMaterial.opacity = space;
+  const up = skyTmp.up;
+  if (skyGroup.visible) {
+    skyGroup.position.copy(camera.position); // centred on the camera: infinitely far away
+    skyGroup.scale.setScalar(camera.far * 0.9); // inside the far plane
+    skyGroup.quaternion.setFromUnitVectors(skyTmp.z, up);
+    u.space.value = space;
+    // The sun direction in the sky's own (rotated) coordinates
+    if (sunState.dir) u.sunDir.value.copy(sunState.dir).applyQuaternion(skyTmp.q.copy(skyGroup.quaternion).invert());
+  }
+  if (celestialGroup.visible) {
+    celestialGroup.position.copy(camera.position);
+    celestialGroup.scale.setScalar(camera.far * 0.99); // just inside the far plane, behind everything else
+    starUniforms.up.value.copy(up);
+    starUniforms.space.value = space;
+    starUniforms.pixelRatio.value = renderer.getPixelRatio();
+    // Names: of stars above the horizon (or anywhere in space), fading out by day like the stars
+    const names = $('starNamesOn').checked, fade = Math.max(space, starUniforms.fade.value);
+    for (const label of starNameLabels) {
+      const above = label.position.dot(up) > 0;
+      label.visible = names && fade > 0.15 && (above || space > 0.5);
+      label.material.opacity = 0.8 * fade;
+    }
+  }
+  if (sunGroup.visible) {
+    sunGroup.position.copy(camera.position);
+    sunGroup.scale.setScalar(camera.far * 0.97);
+    // Below the local horizon the sun and moon are hidden, except far out in space (there the globe hides them)
+    const disc = sunGroup.children[0];
+    if (sunState.dir) disc.visible = space > 0.5 || sunState.dir.dot(up) > -0.06;
+    if (moonState.dir) moon.visible = space > 0.5 || moonState.dir.dot(up) > -0.02;
+    moonMaterial.uniforms.night.value = Math.max(space, starUniforms.fade.value);
+  }
 }
 
 // Drawing only when something changes, so an idle view costs (almost) nothing. Things that change the scene
@@ -594,24 +747,15 @@ controls.addEventListener('change', () => requestRender());
 renderer.setAnimationLoop((now) => {
   const dt = Math.min(flyClock.getDelta(), 0.1); // capped, so a stalled frame does not jump far
   fly(dt);
-  const cameraMoved = controls.update();
-  applyAttitude(dt);
+  const cameraMoved = flight.active ? false : controls.update(); // while flying the plane has the camera
   updateFlightInfo(now);
   streamlines.update(dt);
-  const flying = flyKeys.size > 0 || Object.values(flight).some((v) => v !== 0);
-  const banking = Math.abs(attitude.bank) > 1e-5 || Math.abs(attitude.nose) > 1e-5;
-  if (!(cameraMoved || flying || banking || streamlines.object.visible || pickPending || renderFrames > 0)) return;
+  const skyMoving = advanceSkyClock(now);
+  const flying = flight.active && (flyKeys.size > 0 || flightMoving());
+  if (!(cameraMoved || flying || skyMoving || streamlines.object.visible || pickPending || renderFrames > 0)) return;
   if (renderFrames > 0) renderFrames--;
   if (globe) fitClipPlanes();
-  if (skyGroup.visible) {
-    skyGroup.position.copy(camera.position); // centred on the camera: infinitely far away
-    skyGroup.scale.setScalar(camera.far * 0.9); // inside the far plane
-    orientSky();
-  }
-  if (sunGroup.visible) {
-    sunGroup.position.copy(camera.position);
-    sunGroup.scale.setScalar(camera.far * 0.85);
-  }
+  updateSkyObjects();
   updateHaze();
   if (state.volume && volumeGroup.visible) updateVolumeCamera(state.volume.mesh, camera);
   if (pickPending) {
@@ -916,21 +1060,171 @@ function cacheFrame(key, grid) {
   }
 }
 
-// The grid for a request: from the cache, from a load already running, or loaded now
-function fetchFrame({ opts, meta, key }, { signal, onProgress, onUrl, force = false } = {}) {
-  if (!force) {
-    const grid = cachedFrame(key);
-    if (grid) return Promise.resolve(Object.assign(grid, meta)); // the vertical coordinate switch can have changed it
-    if (framesLoading.has(key)) return framesLoading.get(key);
+// Cubes are loaded in workers (see cubeworker.js), so downloading and parsing the next times of an animation does
+// not make the view stutter. Two of them: one can parse a time while the other downloads the next. Without
+// workers (or when one fails to start) the cube is loaded on the main thread as before.
+const cubeWorkers = (() => {
+  try {
+    return [0, 1].map(() => {
+      const w = new Worker(new URL('./cubeworker.js', import.meta.url), { type: 'module' });
+      w.jobs = new Map(); // id → { resolve, reject, onProgress, onUrl, opts, signal, done }
+      w.addEventListener('message', ({ data: m }) => {
+        const job = w.jobs.get(m.id);
+        if (!job) return;
+        if (m.type === 'url') job.onUrl?.(m.url);
+        else if (m.type === 'progress') job.onProgress?.(m.progress);
+        else if (m.type === 'done') job.done(null, m.grid);
+        else if (m.type === 'error') job.done(Object.assign(new Error(m.error.message), m.error));
+      });
+      // The worker could not be started (e.g. an old cached module): its loads run on the main thread
+      w.addEventListener('error', (e) => {
+        console.warn('Cube worker failed, loading on the main thread', e.message || e);
+        w.failed = true;
+        for (const job of w.jobs.values()) loadCube(job.opts, job).then((g) => job.done(null, g), (err) => job.done(err));
+      });
+      return w;
+    });
+  } catch (e) {
+    console.warn('No cube workers, loading on the main thread', e);
+    return [];
   }
-  const promise = loadCube(opts, { signal, onProgress, onUrl })
+})();
+let cubeJobId = 0;
+
+// The local cache (Data → Local cache): its limit in bytes, 0 = off; remembered in this browser
+const localCacheLimit = () => Number($('localCache').value) * 1024 * 1024;
+let cacheInfoQueued = null, storedKeys = new Set(); // the request keys in the local cache
+function updateLocalCacheInfo(delay = 300) {
+  clearTimeout(cacheInfoQueued);
+  cacheInfoQueued = setTimeout(async () => {
+    try {
+      const { count, bytes, keys } = await frameStoreUsage();
+      storedKeys = keys;
+      updateLoadBlocks();
+      $('localCacheInfo').textContent = count ? `${count} time${count > 1 ? 's' : ''}, ${fmtBytes(bytes)}` : 'empty';
+    } catch {
+      $('localCacheInfo').textContent = 'not available';
+    }
+  }, delay);
+}
+
+function loadCubeOffThread(opts, { signal, onProgress, onUrl, key } = {}) {
+  const workers = cubeWorkers.filter((w) => !w.failed);
+  if (!workers.length) return loadCube(opts, { signal, onProgress, onUrl });
+  const w = workers.reduce((a, b) => (b.jobs.size < a.jobs.size ? b : a)); // the least busy one
+  const id = ++cubeJobId;
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const onAbort = () => {
+      w.postMessage({ type: 'abort', id });
+      job.done(new DOMException('Aborted', 'AbortError'));
+    };
+    const job = {
+      opts, signal, onProgress, onUrl,
+      done: (err, grid) => {
+        if (!w.jobs.has(id)) return; // already settled (aborted)
+        w.jobs.delete(id);
+        signal?.removeEventListener('abort', onAbort);
+        if (err) reject(err);
+        else resolve(grid);
+      },
+    };
+    w.jobs.set(id, job);
+    signal?.addEventListener('abort', onAbort);
+    w.postMessage({ type: 'load', id, opts, key, store: { limit: localCacheLimit() } });
+  });
+}
+
+// While times are loading, the view shows a block per time of the run (see index.html #loadBlocks): filled when
+// in memory, partly filled while loading (by the level requests done or the bytes received), framed when shown.
+const frameProgress = new Map(); // key → fraction loaded, for the loads running
+let loadBlocksQueued = false, loadBlocksHide = null;
+
+function progressFraction(p) {
+  switch (p?.phase) {
+    case 'levels': return p.total ? p.done / p.total : 0;
+    case 'downloading': return p.total ? 0.1 + (0.8 * p.done) / p.total : 0.3;
+    case 'parsing': return 0.95;
+    default: return 0.03; // waiting for the server
+  }
+}
+
+function updateLoadBlocks() {
+  if (loadBlocksQueued) return;
+  loadBlocksQueued = true;
+  requestAnimationFrame(() => {
+    loadBlocksQueued = false;
+    drawLoadBlocks();
+  });
+}
+
+function drawLoadBlocks() {
+  const el = $('loadBlocks');
+  if (framesLoading.size) {
+    clearTimeout(loadBlocksHide);
+    loadBlocksHide = null;
+    el.classList.add('visible');
+  } else if (el.classList.contains('visible') && !loadBlocksHide) {
+    loadBlocksHide = setTimeout(() => { el.classList.remove('visible'); loadBlocksHide = null; }, 1500);
+  }
+  if (!el.classList.contains('visible')) return;
+  const times = [...$('datetime').options].map((o) => o.value);
+  let keys;
+  try {
+    keys = times.map((t) => buildRequest(t).key);
+  } catch {
+    return; // the panel settings are not valid (yet)
+  }
+  const row = el.querySelector('.lb-row');
+  while (row.children.length < times.length) {
+    const b = document.createElement('div');
+    b.append(document.createElement('i'));
+    row.append(b);
+  }
+  while (row.children.length > times.length) row.lastChild.remove();
+  let loaded = 0, local = 0;
+  times.forEach((t, n) => {
+    const b = row.children[n], inMemory = frameCache.has(keys[n]), f = frameProgress.get(keys[n]);
+    const stored = !inMemory && f == null && storedKeys.has(keys[n]); // in the local cache: there in a moment
+    if (inMemory) loaded++;
+    if (stored) local++;
+    b.className = `lb${inMemory ? ' done' : f != null ? ' loading' : stored ? ' stored' : ''}${t === state.grid?.datetime ? ' current' : ''}`;
+    b.firstChild.style.width = `${inMemory || stored ? 100 : f != null ? Math.round(f * 100) : 0}%`;
+  });
+  el.querySelector('.lb-label').textContent = `${loaded} of ${times.length} times in memory` +
+    (local ? `, ${local} more in the local cache` : '') + (framesLoading.size ? ` · loading ${framesLoading.size}` : '');
+}
+
+// The grid for a request: from the cache, from a load already running, or loaded now
+function fetchFrame({ opts, meta, key }, { signal, onProgress, onUrl } = {}) {
+  const grid = cachedFrame(key);
+  if (grid) return Promise.resolve(Object.assign(grid, meta)); // the vertical coordinate switch can have changed it
+  if (framesLoading.has(key)) return framesLoading.get(key);
+  frameProgress.set(key, 0);
+  const progress = (p) => {
+    frameProgress.set(key, progressFraction(p));
+    updateLoadBlocks();
+    onProgress?.(p);
+  };
+  const promise = loadCubeOffThread(opts, { signal, onProgress: progress, onUrl, key })
     .then((grid) => {
       Object.assign(grid, meta);
       cacheFrame(key, grid);
       return grid;
     })
-    .finally(() => { if (framesLoading.get(key) === promise) framesLoading.delete(key); });
+    .finally(() => {
+      if (framesLoading.get(key) === promise) {
+        framesLoading.delete(key);
+        frameProgress.delete(key);
+      }
+      updateLoadBlocks();
+      updateLocalCacheInfo(1000); // after the worker has written it
+    });
   framesLoading.set(key, promise);
+  updateLoadBlocks();
   return promise;
 }
 
@@ -942,10 +1236,12 @@ function showGrid(grid) {
   state.grid = grid;
   rebuildAll();
   if (refit) fitCamera();
+  updateLoadBlocks(); // the frame around the shown time
 }
 
-// force: load again from the server, also when the cube is in the cache (the Load button)
-async function loadData({ force = false } = {}) {
+// Shows the time of the panel settings: from memory, the local cache or the server (Data → Local cache → Clear
+// empties the local cache, so the times are loaded from the server again)
+async function loadData() {
   stopAnimation();
   await state.timesReady;
   state.abort?.abort();
@@ -959,7 +1255,7 @@ async function loadData({ force = false } = {}) {
     return;
   }
   const { opts } = request;
-  const cached = !force && cachedFrame(request.key);
+  const cached = cachedFrame(request.key);
   if (cached) {
     showGrid(Object.assign(cached, request.meta));
     setStatus(`Shown from memory: ${cached.nx}×${cached.ny}×${cached.nz} points at ${opts.datetime}`);
@@ -975,7 +1271,6 @@ async function loadData({ force = false } = {}) {
   try {
     const grid = await fetchFrame(request, {
       signal: ac.signal,
-      force,
       onUrl: (u) => { $('requestUrl').href = u; $('requestUrl').textContent = u; },
       onProgress: loader.update,
     });
@@ -983,10 +1278,10 @@ async function loadData({ force = false } = {}) {
     await new Promise((res) => requestAnimationFrame(() => setTimeout(res)));
     if (state.abort !== ac) return; // another load or the animation took over
     showGrid(grid);
-    const s = ((performance.now() - t0) / 1000).toFixed(1);
+    const s = ((performance.now() - t0) / 1000).toFixed(grid.fromStore ? 2 : 1);
     const step = grid.stride > 1 ? ` (${grid.sourceSize.join('×')} averaged ${grid.stride}×${grid.stride})`
       : grid.serverReduced ? ' (fewer cells, chosen by the server)' : '';
-    setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${grid.proj ? ' on the native grid' : ''}${step} with ${grid.requests} request${grid.requests > 1 ? 's' : ''} in ${s} s` +
+    setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${grid.proj ? ' on the native grid' : ''}${step}${grid.fromStore ? ' from the local cache' : ` with ${grid.requests} request${grid.requests > 1 ? 's' : ''}`} in ${s} s` +
       (grid.scaleFixed ? ` (×10 server fix applied to ${grid.scaleFixed} response${grid.scaleFixed > 1 ? 's' : ''})` : ''));
   } catch (e) {
     if (e.name === 'AbortError') setStatus('Cancelled');
@@ -1007,12 +1302,73 @@ async function loadData({ force = false } = {}) {
 // shown, and every loaded time stays in the frame cache, so the second loop plays from memory.
 
 const anim = { playing: false, abort: null };
+
+// While animating, the sun, moon and stars do not jump from one time to the next: the sky's time runs smoothly
+// from the shown time to the next one during the frame interval, and waits there if the next one is still loading
+const skyClock = { from: null, to: null, start: 0, duration: 1, shown: null, hudAt: 0 };
+function skyTime() {
+  const shown = state.grid?.shownTime || state.grid?.datetime; // an in-between frame has its own time
+  const fallback = shown ? Date.parse(shown) : Date.now();
+  if (!anim.playing || skyClock.from == null) return fallback;
+  const f = THREE.MathUtils.clamp((performance.now() - skyClock.start) / skyClock.duration, 0, 1);
+  return skyClock.from + (skyClock.to - skyClock.from) * f;
+}
+function startSkyClock(time, nextTime, start = performance.now()) {
+  const from = Date.parse(time), to = Date.parse(nextTime);
+  Object.assign(skyClock, { from, to: to > from ? to : from, start, duration: Math.max(Number($('vcSpeed').value), 50) });
+}
+const holdSkyClock = (time) => startSkyClock(time, time); // stays at this time until the next step starts
+
+// In between two loaded times (Appearance → In between): every value interpolated linearly, directions along the
+// shorter way round. Only for the same grid and parameters; it is shown, not cached.
+const sameShape = (a, b) => a && b && a.nx === b.nx && a.ny === b.ny && a.nz === b.nz && a.param === b.param &&
+  Object.keys(a.data).every((p) => b.data[p]?.length === a.data[p].length);
+
+// The in-between frames write into two sets of arrays in turn (the one shown and the next), so they do not leave
+// megabytes of garbage behind every frame
+const tweenBuffers = [{}, {}];
+let tweenTurn = 0;
+function interpolateGrid(a, b, f, time) {
+  const data = {}, buffers = tweenBuffers[(tweenTurn ^= 1)];
+  for (const [p, B] of Object.entries(b.data)) {
+    const A = a.data[p];
+    const out = buffers[p]?.length === B.length ? buffers[p] : (buffers[p] = new Float32Array(B.length));
+    if (p === b.wind?.dir) {
+      for (let n = 0; n < B.length; n++) {
+        const d = ((B[n] - A[n] + 540) % 360) - 180;
+        const v = (A[n] + f * d + 360) % 360;
+        out[n] = v === v ? v : f < 0.5 ? A[n] : B[n];
+      }
+    } else {
+      for (let n = 0; n < B.length; n++) {
+        const v = A[n] + (B[n] - A[n]) * f;
+        out[n] = v === v ? v : f < 0.5 ? A[n] : B[n]; // where only one has data: the nearer one
+      }
+    }
+    data[p] = out;
+  }
+  const g = { ...a, data, shownTime: time };
+  delete g.uid; // a new field for the isosurface worker
+  delete g.rangeOf; // and its own range
+  return g;
+}
+// Called every frame: moves the sky on when its time changed; true while it is moving
+function advanceSkyClock(now) {
+  if (!anim.playing || skyClock.from == null || skyClock.to === skyClock.from) return false;
+  if (!(sunGroup.visible || celestialGroup.visible)) return false;
+  const t = skyTime();
+  if (t === skyClock.shown) return false;
+  updateSun({ hud: now - skyClock.hudAt > 250 }); // the HUD a few times a second
+  if (now - skyClock.hudAt > 250) skyClock.hudAt = now;
+  return true;
+}
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 function updatePlayButton() {
-  $('vcPlay').textContent = anim.playing ? '⏸' : '▶';
+  $('vcPlay').textContent = anim.playing ? '\u23F8\uFE0E' : '\u25B6\uFE0E'; // text, not emoji, symbols
   $('vcPlay').title = anim.playing ? 'Pause the animation' : 'Animate over time';
   $('vcPlay').classList.toggle('active', anim.playing);
+  $('vcStop').disabled = !anim.playing && $('vcTime').selectedIndex <= 0;
 }
 
 function stopAnimation() {
@@ -1020,6 +1376,8 @@ function stopAnimation() {
   anim.playing = false;
   anim.abort?.abort();
   anim.abort = null;
+  skyClock.from = null;
+  updateSun(); // back to the shown time
   updatePlayButton();
   $('vcAnimInfo').textContent = '';
   setStatus('Animation paused');
@@ -1037,25 +1395,52 @@ async function startAnimation() {
   const { signal } = anim.abort;
   updatePlayButton();
   let index = Math.max(0, times.indexOf(state.grid?.datetime ?? $('datetime').value));
+  let current = state.grid; // the grid shown for times[index]
+  let shownAt = performance.now();
+  holdSkyClock(times[index]);
+  requestRender();
   try {
     while (anim.playing) {
       const next = (index + 1) % times.length;
-      const t0 = performance.now();
       const request = buildRequest(times[next]);
-      if (!cachedFrame(request.key)) $('vcAnimInfo').textContent = 'loading…';
+      const ready = !!cachedFrame(request.key); // loading shows in the block bar in the view
       const grid = await fetchFrame(request, { signal });
       // Load the next times while this one is shown (Prefetch in the view bar)
       const ahead = Number($('vcPrefetch').value) || 1;
       for (let a = 1; a <= Math.min(ahead, times.length - 1); a++) {
         fetchFrame(buildRequest(times[(next + a) % times.length]), { signal }).catch(() => {});
       }
-      await sleep(Number($('vcSpeed').value) - (performance.now() - t0));
+      if (!anim.playing) break;
+      // The step to the next time starts when that one is there: from when this one was shown if it was in
+      // memory already, otherwise now (the sky and the data waited at this time meanwhile)
+      const stepStart = ready ? shownAt : performance.now();
+      const speed = Number($('vcSpeed').value);
+      startSkyClock(times[index], times[next], stepStart);
+      const t0 = Date.parse(times[index]), t1 = Date.parse(times[next]);
+      const tween = Number($('tweenStep').value) * 60000;
+      if (tween > 0 && t1 - t0 > tween && sameShape(current, grid)) {
+        // In between frames at whole multiples of the interval, following the sky's clock
+        let shown = t0;
+        while (anim.playing && performance.now() - stepStart < speed) {
+          const t = t0 + Math.floor((skyTime() - t0) / tween) * tween;
+          if (t > shown && t < t1) {
+            shown = t;
+            showGrid(interpolateGrid(current, grid, (t - t0) / (t1 - t0), toIso(t)));
+          }
+          await new Promise((res) => requestAnimationFrame(res));
+        }
+      } else {
+        await sleep(speed - (performance.now() - stepStart));
+      }
       if (!anim.playing) break;
       $('datetime').value = times[next];
+      shownAt = performance.now();
+      holdSkyClock(times[next]);
       showGrid(grid);
       $('vcAnimInfo').textContent = `${next + 1}/${times.length}`;
       setStatus(`Animating: ${times[next]} (${next + 1} of ${times.length}), ${frameCache.size} times in memory (${fmtBytes(frameCacheBytes)})`);
       index = next;
+      current = grid;
       await new Promise((res) => requestAnimationFrame(res)); // let the frame be drawn
     }
   } catch (e) {
@@ -1141,9 +1526,16 @@ async function applyUrl() {
 
 // ---------------------------------------------------------------- geometry
 
+// The scene positions only change with the grid, levels and vertical coordinate: a new time of the same grid (an
+// animation step or an in-between frame) keeps them, unless the heights come from the data (pressure altitude)
+let geoKey = null;
 function computeGeo() {
   const g = state.grid;
   const { nx, ny, nz, lons, lats } = g;
+  const fromData = g.vmode === 'pressure' && !!g.data[g.pressureParam];
+  const key = fromData ? null : [viewKey(g), nz, g.vkind, g.levels.join(','), g.proj?.proj4 ?? ''].join('|');
+  if (key && key === geoKey && state.geo) return;
+  geoKey = key;
   const lon0 = (lons[0] + lons[nx - 1]) / 2, lat0 = (lats[0] + lats[ny - 1]) / 2;
   const kx = 111.32 * Math.cos((lat0 * Math.PI) / 180), ky = 110.57;
   const px = Float32Array.from(lons, (l) => (l - lon0) * kx);
@@ -1195,10 +1587,14 @@ function sceneFrame(g, lon0, lat0, kx, ky) {
 }
 
 // Sun at the shown time: its direction in the scene (towards the sun), the light, the sky's daylight and the disc
-function updateSun() {
+function updateSun({ hud = true } = {}) {
+  const time = skyTime();
+  skyClock.shown = time;
+  updateStars(time);
   const on = $('sunOn').checked && state.grid && state.geo;
   sunGroup.visible = !!on;
   if (!on) {
+    moonState.dir = null;
     sunState.dir = null;
     sun.position.copy(DEFAULT_LIGHT);
     sun.intensity = 1.8;
@@ -1206,14 +1602,14 @@ function updateSun() {
     volumeUniforms.lightDir.value.set(-0.4, -0.6, 1.0).normalize();
     skyDomeMaterial.uniforms.daylight.value = 0;
     skyDomeMaterial.uniforms.sunDir.value.set(0, 0, -1);
-    starMaterial.opacity = 1;
+    starUniforms.fade.value = 1;
     globeEarthUniforms.sunOn.value = 0;
     requestRender();
     updateHud();
     return;
   }
   const { frame } = state.geo;
-  const s = sunPosition(state.grid.datetime || Date.now()).ecef;
+  const s = sunPosition(time).ecef;
   const dir = new THREE.Vector3(dot(frame.x, s), dot(frame.y, s), dot(frame.up, s)).normalize();
   sunState.dir = dir;
   sunState.elevation = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(dir.z, -1, 1)));
@@ -1227,22 +1623,56 @@ function updateSun() {
   volumeUniforms.lightDir.value.copy(dir.z > -0.1 ? dir : DEFAULT_LIGHT).normalize();
   skyDomeMaterial.uniforms.daylight.value = daylight;
   skyDomeMaterial.uniforms.sunDir.value.copy(dir);
-  starMaterial.opacity = 1 - daylight;
+  starUniforms.fade.value = 1 - daylight;
   globeEarthUniforms.sunDir.value.copy(dir);
   globeEarthUniforms.sunOn.value = 1;
   const disc = sunGroup.children[0];
   disc.position.copy(dir).multiplyScalar(0.97);
   disc.scale.setScalar(0.11);
-  disc.visible = dir.z > -0.08; // set below the horizon
+  disc.visible = true; // hidden below the horizon by updateSkyObjects
+  // The moon, lit from the sun's direction
+  const m = moonPosition(time);
+  const moonDir = new THREE.Vector3(dot(frame.x, m.ecef), dot(frame.y, m.ecef), dot(frame.up, m.ecef)).normalize();
+  moonState.dir = moonDir;
+  moonState.elevation = THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(moonDir.z, -1, 1)));
+  moonState.illuminated = m.illuminated;
+  moon.position.copy(moonDir).multiplyScalar(0.95);
+  moonMaterial.uniforms.sunDir.value.copy(dir);
   requestRender();
-  updateHud();
+  if (hud) updateHud();
 }
 
+// The stars where they are at the shown time: catalogue directions turned with the sidereal time, into the scene
+function updateStars(time = skyTime()) {
+  if (!state.geo) return;
+  const { frame } = state.geo;
+  const gmst = sunPosition(time).gmst;
+  const pos = celestialGroup.children[0].geometry.attributes.position;
+  for (let i = 0; i < STARS.length / 4; i++) {
+    const v = skyEcef(STARS[i * 4], STARS[i * 4 + 1], gmst);
+    pos.setXYZ(i, dot(frame.x, v) * 0.98, dot(frame.y, v) * 0.98, dot(frame.up, v) * 0.98);
+  }
+  pos.needsUpdate = true;
+  for (const label of starNameLabels) {
+    const i = label.userData.star;
+    label.position.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+  }
+  requestRender();
+}
+
+// Range of the shown field, kept with the grid: showing a time again does not scan all values again
 function dataRange() {
-  const f = state.grid.data[state.grid.param];
+  const g = state.grid, f = g.data[g.param];
+  if (g.rangeOf === f) return g.range;
   let lo = Infinity, hi = -Infinity;
-  for (const v of f) if (v === v) { if (v < lo) lo = v; if (v > hi) hi = v; }
-  return [lo, hi];
+  for (let n = 0; n < f.length; n++) {
+    const v = f[n];
+    if (v < lo) lo = v; // NaN compares false: skipped
+    if (v > hi) hi = v;
+  }
+  g.rangeOf = f;
+  g.range = [lo, hi];
+  return g.range;
 }
 
 // Globe projection (Globe in the view bar): while it is on, every builder places its points through the globe
@@ -1317,9 +1747,17 @@ function rebuildAll() {
   updateColormap();
   buildBox();
   buildGridCells();
-  buildBorders();
-  buildGround();
-  buildEarth();
+  // Borders, the map under the data and the earth around it do not change with the time: an animation step or a
+  // new time of the same area keeps them (rebuilding the borders alone takes a noticeable fraction of a second)
+  const { lon0, lat0, kx, ky, zmin, ext } = state.geo;
+  const staticKey = JSON.stringify([lon0, lat0, kx, ky, zmin, ext, g.lons[0], g.lons.at(-1), g.lats[0], g.lats.at(-1), g.nx, g.ny,
+    g.crs, globe ? globe.vscale : 0, !!state.borders, $('baseLayer').value, $('earthOn').checked]);
+  if (staticKey !== state.staticKey) {
+    state.staticKey = staticKey;
+    buildBorders();
+    buildGround();
+    buildEarth();
+  }
   buildSlices();
   for (const iso of state.isos) buildIso(iso);
   buildVolume();
@@ -1340,8 +1778,20 @@ function disposeVolume() {
 }
 
 function buildVolume() {
-  disposeVolume();
   const g = state.grid;
+  const placement = `${g?.nx}x${g?.ny}x${g?.nz}:${globe ? globe.vscale : 'flat'}`;
+  // A new time of the same grid in the same place (same scene positions): only the values change, written into
+  // the texture there is, without a new texture, mesh or shader set-up
+  if (state.volume && g && state.volume.geo === state.geo && state.volume.placement === placement && $('renderMode').value !== 'iso') {
+    const { pz, zmin, zmax } = state.geo, tex = state.volume.tex;
+    const placedByHeight = g.vkind === 'pressure' || g.vkind === 'height' || (g.vmode === 'pressure' && !!g.data[g.pressureParam]);
+    const vol = resampleVolume(g.data[g.param], g.nx, g.ny, g.nz, pz, zmin, zmax, !placedByHeight, tex.image.data);
+    if (vol.data === tex.image.data) {
+      tex.needsUpdate = true;
+      return;
+    }
+  }
+  disposeVolume();
   if (!g || g.nz < 2 || $('renderMode').value === 'iso') return;
   const { px, py, pz, zmin, zmax } = state.geo;
   // Evenly spaced model levels go into the texture as they are; anything placed at real heights is resampled
@@ -1380,7 +1830,7 @@ function buildVolume() {
   mesh.renderOrder = 10;
   mesh.frustumCulled = false;
   volumeGroup.add(mesh);
-  state.volume = { mesh, tex };
+  state.volume = { mesh, tex, geo: state.geo, placement };
 }
 
 function applyRenderMode() {
@@ -2222,9 +2672,14 @@ function applyVScale() {
   syncViewControls();
 }
 
-function fitCamera() {
-  stopFlight(); // a new view starts at rest
-  attitude.bank = attitude.nose = 0;
+// view (optional, e.g. from a preset): { azimuth (where the camera is, degrees clockwise from grid north),
+// elevation (degrees above the horizontal), distance (× the fitted distance) }
+function fitCamera(view = null) {
+  stopFlight(); // a new view starts at rest, with the mouse
+  if (flight.active) {
+    flight.active = false;
+    controls.enabled = true;
+  }
   if (!state.geo) return;
   if (globe) {
     // Around the curved data, with the far plane beyond the whole Earth
@@ -2232,6 +2687,7 @@ function fitCamera() {
     const d = sphere.radius * 2.2;
     controls.target.copy(sphere.center);
     camera.position.set(sphere.center.x - d * 0.35, sphere.center.y - d * 0.95, sphere.center.z + d * 0.55);
+    if (view) placeCamera(view, sphere.center, d);
     camera.near = d / 500;
     camera.far = Math.max(d * 20, EARTH_RADIUS * 12);
   } else {
@@ -2240,11 +2696,17 @@ function fitCamera() {
     const d = Math.max(ext, (zmax - zmin) * s) * 1.5;
     controls.target.set(0, 0, zmid);
     camera.position.set(-d * 0.35, -d * 0.95, zmid + d * 0.55);
+    if (view) placeCamera(view, controls.target, d);
     camera.near = d / 500;
     camera.far = d * 20;
   }
   camera.updateProjectionMatrix();
   controls.update();
+}
+
+function placeCamera({ azimuth = 200, elevation = 28.5, distance = 1 }, target, d) {
+  const az = THREE.MathUtils.degToRad(azimuth), el = THREE.MathUtils.degToRad(elevation), r = d * 1.14 * distance; // 1.14: the default offset
+  camera.position.set(target.x + r * Math.sin(az) * Math.cos(el), target.y + r * Math.cos(az) * Math.cos(el), target.z + r * Math.sin(el));
 }
 
 // The controls in the 3D view mirror panel controls: the parameter shown, the first isosurface value and the
@@ -2268,6 +2730,7 @@ function syncViewControls() {
   const t = $('vcTime');
   $('vcTimePrev').disabled = t.selectedIndex <= 0;
   $('vcTimeNext').disabled = t.selectedIndex < 0 || t.selectedIndex >= t.options.length - 1;
+  $('vcStop').disabled = !anim.playing && t.selectedIndex <= 0; // already at the start
 
   const iso = state.isos[0];
   $('vcThresholdWrap').hidden = !iso;
@@ -2306,14 +2769,15 @@ function updateHud() {
   if (!g) { $('hud').innerHTML = ''; return; }
   const isoTxt = state.isos.filter((i) => i.visible).map((i) => `${fmt(i.value)} ${g.unit}`).join(', ');
   $('hud').innerHTML =
-    `<b>${g.wind ? `wind (${g.wind.speed} + ${g.wind.dir})` : g.param}</b> · ${g.datetime || ''}<br>` +
+    `<b>${g.wind ? `wind (${g.wind.speed} + ${g.wind.dir})` : g.param}</b> · ${g.shownTime || g.datetime || ''}${g.shownTime ? ' (in between)' : ''}<br>` +
     `run ${g.instance || '–'} · ${levelsText(g)} · ${g.nx}×${g.ny}×${g.nz}` +
     `${g.proj ? ' · native rotated pole grid' : ''}<br>` +
     `read ${fmtCount(g.valuesRead)} values (${g.sourceSize.join('×')} × ${g.nz} levels${Object.keys(g.data).length > 1 ? ` × ${Object.keys(g.data).length} parameters` : ''})` +
     `${g.valuesMissing ? `, ${fmtCount(g.valuesMissing)} without data` : ''}` +
     `${g.stride > 1 ? ` · shown as ${fmtCount(g.nx * g.ny * g.nz)} points (${g.stride}×${g.stride} averaged)` : ''}<br>` +
     `range ${fmt(g.min)} … ${fmt(g.max)} ${g.unit}` + (isoTxt ? `<br>isosurface ${isoTxt}` : '') +
-    (sunState.dir ? `<br>sun ${sunState.elevation >= 0 ? `${fmt(sunState.elevation, 0)}° above` : `${fmt(-sunState.elevation, 0)}° below`} the horizon, azimuth ${fmt(sunState.azimuth, 0)}°` : '');
+    (sunState.dir ? `<br>sun ${sunState.elevation >= 0 ? `${fmt(sunState.elevation, 0)}° above` : `${fmt(-sunState.elevation, 0)}° below`} the horizon, azimuth ${fmt(sunState.azimuth, 0)}°` : '') +
+    (moonState.dir ? `<br>moon ${moonState.elevation >= 0 ? `${fmt(moonState.elevation, 0)}° above` : `${fmt(-moonState.elevation, 0)}° below`} the horizon, ${fmt(moonState.illuminated * 100, 0)}% lit` : '');
 }
 
 // ---------------------------------------------------------------- picking
@@ -2449,9 +2913,12 @@ async function applyPreset(p) {
   if (p.gridCells != null) $('gridOn').checked = p.gridCells; // drawn when the data is shown
   if (p.earth != null) $('earthOn').checked = p.earth;
   if (p.globe != null) $('globeOn').checked = p.globe;
+  if (p.sun != null) $('sunOn').checked = p.sun;
+  if (p.starNames != null) $('starNamesOn').checked = p.starNames;
+  if (p.tween != null) $('tweenStep').value = String(p.tween);
   if (p.sky != null) {
     $('skyOn').checked = p.sky;
-    skyGroup.visible = p.sky;
+    skyGroup.visible = celestialGroup.visible = p.sky;
   }
   if (p.concurrency != null) $('concurrency').value = p.concurrency;
   if (p.levels === 'all') {
@@ -2476,7 +2943,8 @@ async function applyPreset(p) {
   updateVolumeSettings();
   updateIsoLines();
   applyVScale();
-  loadData();
+  await loadData();
+  if (state.grid) fitCamera(p.view); // a preset starts with its own view (or the default one)
 }
 
 for (const p of PRESETS) {
@@ -2485,7 +2953,7 @@ for (const p of PRESETS) {
   b.addEventListener('click', () => applyPreset(p));
   $('presetList').append(b);
 }
-$('load').addEventListener('click', () => loadData({ force: true })); // always from the server
+$('load').addEventListener('click', () => loadData()); // from the caches when there
 $('cancel').addEventListener('click', () => { stopAnimation(); state.abort?.abort(); });
 // Reads the collection in the URL field when it is not the loaded one, keeping the current choices where possible.
 // The URL field takes an EDR endpoint (…/edr) or a collection URL (…/edr/collections/{id}). An endpoint lists
@@ -2652,7 +3120,7 @@ const showTime = (value) => {
   $('datetime').value = value;
   $('vcTime').value = value;
   syncViewControls();
-  loadData();
+  return loadData();
 };
 $('vcTime').addEventListener('change', () => showTime($('vcTime').value));
 $('vcTimePrev').addEventListener('click', () => showTime($('vcTime').options[$('vcTime').selectedIndex - 1]?.value));
@@ -2675,6 +3143,13 @@ $('vcRender').addEventListener('change', () => {
 $('renderMode').addEventListener('change', syncViewControls);
 $('volStyle').addEventListener('input', syncViewControls);
 $('vcPlay').addEventListener('click', () => (anim.playing ? stopAnimation() : startAnimation()));
+// Tape deck: ⏹ ends the animation at the first time
+const firstTime = () => $('vcTime').options[0]?.value;
+$('vcStop').addEventListener('click', async () => {
+  const playing = anim.playing;
+  await showTime(firstTime());
+  if (playing) setStatus('Animation stopped, back at the first time');
+});
 const setThreshold = (value) => {
   const iso = state.isos[0];
   if (!iso || !Number.isFinite(value)) return;
@@ -2709,8 +3184,27 @@ $('mapBrightness').addEventListener('input', () => {
   if (earthMat?.map) earthMat.color.setScalar(Number($('mapBrightness').value) * EARTH_BRIGHTNESS);
 });
 $('gridOn').addEventListener('change', buildGridCells);
-$('skyOn').addEventListener('change', () => (skyGroup.visible = $('skyOn').checked));
+$('skyOn').addEventListener('change', () => (skyGroup.visible = celestialGroup.visible = $('skyOn').checked));
 $('sunOn').addEventListener('change', updateSun);
+// Local cache: the limit is remembered in this browser
+try { const v = localStorage.getItem('localCache'); if (v != null && [...$('localCache').options].some((o) => o.value === v)) $('localCache').value = v; } catch { /* default */ }
+$('localCache').addEventListener('change', async () => {
+  try { localStorage.setItem('localCache', $('localCache').value); } catch { /* not remembered */ }
+  // Off keeps what is stored (Clear removes it); a lower limit drops the oldest times right away
+  if (localCacheLimit() > 0) try { await evictFrames(localCacheLimit()); } catch { /* not available */ }
+  updateLocalCacheInfo(0);
+});
+// Clear: the local cache and the times in memory, so Load gets them from the server again (the shown time stays
+// on screen)
+$('clearCache').addEventListener('click', async () => {
+  try { await clearFrames(); } catch (e) { console.warn('Could not clear the local cache', e); }
+  frameCache.clear();
+  frameCacheBytes = 0;
+  updateLocalCacheInfo(0);
+  setStatus('Cache cleared: times are loaded from the server again');
+});
+updateLocalCacheInfo(0);
+
 $('globeOn').addEventListener('change', () => {
   if (!state.grid) return;
   rebuildAll();

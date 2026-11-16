@@ -105,6 +105,19 @@
           </select>
         </label>
       </div>
+      <div class="row local-cache">
+        <label class="stack grow" title="Loaded times of a run are kept in this browser, decoded, so they are there again in a fraction of a second, also after a reload or another day. The least recently used are dropped beyond the limit.">Local cache
+          <select id="localCache">
+            <option value="0">off</option>
+            <option value="1024">up to 1 GB</option>
+            <option value="2048" selected>up to 2 GB</option>
+            <option value="5120">up to 5 GB</option>
+            <option value="10240">up to 10 GB</option>
+          </select>
+        </label>
+        <span id="localCacheInfo" class="muted grow"></span>
+        <button id="clearCache" title="Remove all cached times (local and in memory), so they are loaded from the server again">Clear</button>
+      </div>
       <div class="row">
         <button id="load" class="primary grow">Load</button>
         <button id="cancel" disabled>Cancel</button>
@@ -206,8 +219,18 @@
         <label class="check" title="Draw the grid cells in use: cell edges on the ground, columns and levels on two walls"><input id="gridOn" type="checkbox"> Grid cells</label>
         <label class="check"><input id="labelsOn" type="checkbox" checked> Labels</label>
       </div>
-      <label class="check" title="A reference while flying: sky, horizon and stars, infinitely far away"><input id="skyOn" type="checkbox"> Sky with horizon and stars</label>
-      <label class="check" title="The sun where it is at the shown time, seen from the centre of the data: its light, and daylight in the sky"><input id="sunOn" type="checkbox"> Sun at the shown time</label>
+      <label class="check" title="A reference while flying: sky, horizon and the real stars at the shown time, infinitely far away"><input id="skyOn" type="checkbox"> Sky with horizon and stars</label>
+      <label class="check" title="The sun and the moon (with its phase) where they are at the shown time, seen from the centre of the data: the sun's light, and daylight in the sky"><input id="sunOn" type="checkbox"> Sun and moon at the shown time</label>
+      <label class="check" title="Names of the brightest stars (with the sky)"><input id="starNamesOn" type="checkbox"> Star names</label>
+      <label class="check" title="Wrap the scene around the Earth: the data at its real place and curvature on a globe"><input id="globeOn" type="checkbox"> Globe</label>
+      <label class="check" title="While animating, also show the data interpolated between two times, e.g. every 10 minutes between hourly times: smoother motion, no extra data loaded">In between
+        <select id="tweenStep" class="inline">
+          <option value="0">off</option>
+          <option value="5">every 5 min</option>
+          <option value="10" selected>every 10 min</option>
+          <option value="15">every 15 min</option>
+          <option value="30">every 30 min</option>
+        </select></label>
       <label class="check" title="The base map continued around the data (about 7× the area) with degree lines"><input id="earthOn" type="checkbox"> Earth surface around the data</label>
       <label class="check"><input id="hazeOn" type="checkbox" checked> Depth haze (fade distant data)</label>
       <label class="slider">Haze amount <input id="hazeAmount" type="range" min="0.05" max="1" step="0.05" value="0.4"><output></output></label>
@@ -227,7 +250,8 @@
           <button id="vcTimePrev" class="icon" title="Previous time">‹</button>
           <select id="vcTime" title="Time shown; changing it loads that time"></select>
           <button id="vcTimeNext" class="icon" title="Next time">›</button>
-          <button id="vcPlay" class="icon play" title="Animate over time">▶</button>
+          <button id="vcPlay" class="icon play deck first" title="Animate over time">&#x25B6;&#xFE0E;</button>
+          <button id="vcStop" class="icon deck" title="Stop: end the animation and go back to the first time">&#x23F9;&#xFE0E;</button>
           <select id="vcSpeed" class="speed" title="Time per frame (at least; loading a new time can take longer)">
             <option value="250">0.25 s</option>
             <option value="500" selected>0.5 s</option>
@@ -265,9 +289,6 @@
           <option value="iso">Isosurface</option>
         </select>
       </label>
-      <label class="vc-check" title="Wrap the scene around the Earth: the data at its real place and curvature on a globe">
-        <span class="vc-inline"><input id="globeOn" type="checkbox"> Globe</span>
-      </label>
       <label id="vcStreamWrap" class="vc-check" title="Particles moving with the wind, inside the volume" hidden>
         <span class="vc-inline"><input id="vcStream" type="checkbox" checked> Streamlines</span>
       </label>
@@ -280,9 +301,10 @@
     </div>
     <div id="hud"></div>
     <div id="flightInfo" class="flight-info" aria-live="off"></div>
-    <div class="keys-hint">Fly: <kbd>W</kbd><kbd>S</kbd> faster/slower · <kbd>A</kbd><kbd>D</kbd> sideways ·
-      <kbd>Q</kbd><kbd>E</kbd> down/up · <kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd> turn · <kbd>Shift</kbd> boost ·
-      <kbd>Space</kbd> stop</div>
+    <div id="loadBlocks" class="load-blocks" aria-live="off"><div class="lb-label"></div><div class="lb-row"></div></div>
+    <div class="keys-hint">Fly: <kbd>W</kbd><kbd>S</kbd> faster/slower, backwards · <kbd>↑</kbd><kbd>↓</kbd> pitch ·
+      <kbd>←</kbd><kbd>→</kbd> roll · <kbd>A</kbd><kbd>D</kbd> rudder · <kbd>R</kbd> level · <kbd>Shift</kbd> boost ·
+      <kbd>Space</kbd> stop · mouse: orbit</div>
     <div id="tooltip" hidden></div>
     <div id="overlay" hidden>
       <div class="loader">

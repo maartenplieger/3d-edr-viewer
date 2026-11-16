@@ -46,7 +46,10 @@ export class Streamlines {
     const keep = this.field && this.field.nx === field.nx && this.field.ny === field.ny && this.field.nz === field.nz;
     // The 99th percentile only depends on the speeds, not on where particles may start (e.g. the threshold)
     if (this.topOf !== field.speed) {
-      const sorted = Float32Array.from(field.speed.filter((s) => s === s)).sort();
+      // From a sample of at most ~50 000 points: sorting every point took long for large grids
+      const step = Math.max(1, Math.floor(field.speed.length / 50000)), sample = [];
+      for (let n = 0; n < field.speed.length; n += step) if (field.speed[n] === field.speed[n]) sample.push(field.speed[n]);
+      const sorted = Float32Array.from(sample).sort();
       this.top = sorted.length ? sorted[Math.floor(sorted.length * 0.99)] : 0;
       this.topOf = field.speed;
     }

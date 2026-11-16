@@ -5,20 +5,26 @@ const half = THREE.DataUtils.toHalfFloat;
 
 // Texel pair (value × mask, mask): linear filtering then averages only valid neighbours,
 // recovered in the shader as r / g.
+const HALF_ONE = half(1);
 function put(out, i, v) {
-  const ok = v === v;
-  out[2 * i] = half(ok ? v : 0);
-  out[2 * i + 1] = half(ok ? 1 : 0);
+  if (v === v) {
+    out[2 * i] = half(v);
+    out[2 * i + 1] = HALF_ONE;
+  } else {
+    out[2 * i] = out[2 * i + 1] = 0; // half 0
+  }
 }
 
 /**
  * Resamples the field onto a grid that is regular in world z, bottom level first, as RG half
  * floats (value, validity). pz holds the world height of every grid point (k = 0 is the top level).
  */
-export function resampleVolume(field, nx, ny, nz, pz, zmin, zmax, uniformLevels) {
+export function resampleVolume(field, nx, ny, nz, pz, zmin, zmax, uniformLevels, reuse = null) {
   const layer = nx * ny;
+  // reuse: the array of a previous result of the same size, written over (e.g. a new time of the same grid)
+  const array = (n) => (reuse?.length === n ? reuse : new Uint16Array(n));
   if (uniformLevels) {
-    const out = new Uint16Array(layer * nz * 2);
+    const out = array(layer * nz * 2);
     for (let t = 0; t < nz; t++) {
       const src = (nz - 1 - t) * layer;
       for (let n = 0; n < layer; n++) put(out, t * layer + n, field[src + n]);
@@ -26,7 +32,7 @@ export function resampleVolume(field, nx, ny, nz, pz, zmin, zmax, uniformLevels)
     return { data: out, depth: nz };
   }
   const depth = Math.min(256, Math.max(96, nz * 2));
-  const out = new Uint16Array(layer * depth * 2);
+  const out = array(layer * depth * 2);
   for (let n = 0; n < layer; n++) {
     const h = (k) => pz[k * layer + n];
     let k = nz - 1;
