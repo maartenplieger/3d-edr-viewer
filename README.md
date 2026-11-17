@@ -35,6 +35,10 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 
 ## Notes
 
+- **View bar.** The controls at the top of the view (parameter, time, threshold, density, how it is shown,
+  vertical scale, streamlines, fly around) are compact, with their labels beside them; ▴ at its right end
+  collapses it to a small *▾ View* button (remembered in this browser). The animation controls are on the time
+  line at the bottom.
 - **Panel.** « at the top of the panel hides it, so the 3D view gets the whole window; ☰ in the view bar
   brings it back. The choice is remembered in the browser.
 - **Grid cells.** *Appearance → Grid cells* draws the cells in use: their edges on the ground, and on the
@@ -55,6 +59,22 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   ray marching turns every sample back to the flat data. With *Earth surface* the whole globe gets a world base
   map (the selected layer stays on the data area), with the night side darker when the sun is on. Far above the
   Earth the sky fades to black space with stars all around. Changing the vertical scale rebuilds the geometry.
+  The volume is ray marched only where the ray is inside the shell of the data around the Earth (from its top to
+  the ground), with the opacity measured in the data's own space, so even data covering the whole Earth (a thin
+  shell in a big box) is sampled finely and looks as in the flat view. The steps adapt to about one texel of the
+  data each (fine where the ray crosses levels or cells quickly, long where it runs along them); *Quality* sets
+  the finest step allowed. The Earth's axis is drawn through the
+  poles, with N and S. When the data covers a large part of the Earth (150° of longitude or 100° of latitude),
+  the view is centred on the Earth itself with north up: the mouse orbits about the Earth's axis, *Fly around*
+  spins around it near the equator, labels stay a readable size and the box is left out. The map under the data
+  uses the selected base layer when that covers most of the data, otherwise the world layer.
+- **Vector base map.** *Appearance → Base map → Land and sea (vector, Natural Earth)* draws land, sea, coastlines
+  and country borders from the Natural Earth 1:10M vectors of the border file (`src/vectormap.js`) into a canvas
+  in the grid's own coordinates (also a rotated pole grid), instead of a WMS image: no map server needed, the
+  same style for the whole world, flat or on the globe. The global ECMWF preset uses it. It is drawn in a web worker
+  (`src/vectorworker.js`) on a CPU canvas: drawing thousands of polygons takes seconds, and an accelerated canvas
+  would be drawn in the browser's GPU process, which the WebGL view shares; the view stays responsive while the
+  map is drawn (a few seconds the first time).
 - **Wind with streamlines.** When a collection has both wind speed and wind direction
   (`wind_speed…` and `wind_from_direction…`), the parameter list ends with *Wind: speed + direction, with
   streamlines*. It loads both: the speed is drawn as usual, and 4000 particles with fading trails move with the
@@ -83,7 +103,7 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   loads it; ‹ › step to the previous or next time), the threshold (the first isosurface value, also the
   volume's fill threshold) with the volume density below it, how it is shown (volume filled above, below or in a band around the threshold, or
   an isosurface) and the vertical scale. They drive the same controls as the panel and stay in sync with it.
-- **Animation.** ▶ next to the time steps through the times of the run and wraps around; ⏸ pauses, ⏹ stops
+- **Animation.** ▶ on the time line at the bottom of the view steps through the times of the run and wraps around; ⏸ pauses, ⏹ stops
   at the first time of the loop. The loop-length menu (*all times*, or 6, 12, 24 or 48) limits the loop to that
   many times from the time shown when ▶ is pressed (shifted back when the run ends sooner); pausing and playing
   again keeps the loop, and the block bar dims the times outside it. The menu next to ▶ sets the time per
@@ -98,28 +118,38 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
   the volume is shown, this is done on the graphics card: the next time goes into a second 3D texture once per
   step and every in-between frame only changes the blend, so it costs nothing on the main thread (continuous
   then means every drawn frame). With isosurfaces, slices or streamlines the values are interpolated on the
-  CPU (every 5 minutes when continuous). Cubes are downloaded, parsed
+  CPU: continuous with isosurfaces means the next in-between frame as soon as the isosurface worker has finished
+  the one before (as smooth as it can compute), otherwise every 5 minutes. Cubes are downloaded, parsed
   and averaged in two web workers (`src/cubeworker.js`), so loading the next times does not hold up the view.
 - **Time line.** The bar at the bottom of the view has a block per time of the run: filled when in memory,
   partly filled while loading (by level requests done or bytes received), lightly filled when in the local
   cache, the shown time framed. Its playhead follows the shown moment, smoothly while animating, and its label
   gives that moment. Click or drag it to show any moment, also between two times (pauses the animation): blended
   on the graphics card when only the volume is shown, interpolated otherwise, following *In between* (off: the
-  nearest time). The HUD in the top right describes the loaded time and only changes when that changes, so it
+  nearest time). Times not in memory yet are loaded when touched, most recently touched first and at
+  most *ahead* at once; meanwhile the nearest time in memory is shown and the playhead already follows the
+  pointer, and the moment appears when its times arrive. The HUD in the top right describes the loaded time and only changes when that changes, so it
   stays calm while animating.
 - **Fly around.** *Fly around* in the view bar circles the camera slowly around the data (one turn in two
-  minutes, rising and sinking a little), from a distance where all of it is in view. Dragging and zooming
-  still work while it circles; flying with the keys stops it.
+  minutes, rising and sinking a little), from a distance where all of it is in view. While the animation plays
+  it moves with it, at the pace of the chosen frame time, and waits while a time is still loading and when the
+  loop wraps; without an animation it circles on its own. Dragging and zooming still work while it circles;
+  flying with the keys stops it.
 - **Frame rate.** *Appearance → Frame rate* (on by default) shows in the bottom right of the view the frames
   drawn per second, the longest gap between two drawn frames (a stutter shows up there, orange above 50 ms) and
   the main-thread time per frame. The view is drawn on demand, so it says *idle* when nothing moves.
+- **Background loading.** *Data → Load the other times in the background* (off after every page load) loads the other times
+  of the run one at a time while not animating, forward from the shown time and then from the start, skipping
+  those in memory or in the local cache, so they are there when you step, scrub or animate. It waits while
+  animating (which loads ahead itself), scrubbing or loading, and while the tab is hidden; each time is loaded
+  at most once per session.
 - **Local cache.** *Data → Local cache* (default up to 2 GB) keeps the loaded times of a run in the browser
   (IndexedDB, `src/framestore.js`), decoded as the viewer uses them, so they are back in a fraction of a second,
   also after a reload or on another day; the least recently used are dropped beyond the limit. *Clear* removes
   them all, and the times in memory, so they are loaded from the server again (*Load* uses the caches). Only times of a run (an instance) are kept, as their data does not change. In the block bar they show
   as lightly filled blocks. Besides, the browser's own HTTP cache keeps geoservices responses for 10 hours.
 - **Flying.** Fly through the scene with the keyboard, like a plane: <kbd>W</kbd>/<kbd>S</kbd> throttle (S slows
-  down, and past zero flies backwards, up to the same top speed), <kbd>↑</kbd>/<kbd>↓</kbd> pitch the nose up and down (hold <kbd>↑</kbd> for a loop, about 15 s),
+  down, and past zero flies backwards, up to the same top speed), <kbd>↑</kbd>/<kbd>↓</kbd> pitch the nose down and up, like a flight stick (hold <kbd>↓</kbd> for a loop, about 15 s),
   <kbd>←</kbd>/<kbd>→</kbd> roll, <kbd>A</kbd>/<kbd>D</kbd> rudder, <kbd>R</kbd> levels out (wings level, nose to
   the horizon, keeping the heading), <kbd>Space</kbd> stops and <kbd>Shift</kbd> gives 2× throttle and top speed.
   While flying the camera has its own attitude, so it can roll, fly upside down and loop. A banked plane turns by
@@ -142,6 +172,10 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
     stream (filled above 93.5 kt, density 0.83, vertical scale ×4.9), with the sun, moon, stars and star names,
     continuous in-between frames, seen from the south-east. Presets can set their own camera view
     (`view: { azimuth, elevation, distance }`), and switch the globe, sun and star names on or off.
+  - *Jet streams – global (ECMWF IFS, meteocore)*: ECMWF IFS from FMI's meteocore, wind speed on all 14 pressure
+    levels (1000–10 hPa), the whole Earth resampled by the server to 720×360 points (one level per request:
+    meteocore counts two values per cell against its limit of a million), on the globe filled above 33 m/s,
+    with the sun, moon, stars and star names, flying around the Earth's axis.
   - *Jet stream – Nordic (MEPS, meteocore)*: the MEPS forecast from FMI's meteocore
     (`https://meteocore.app.meteo.fi/edr`), wind speed on 13 pressure levels (1000–50 hPa) at their height,
     filled above 25 m/s (≈ 50 kt) with vertical scale ×15. The full domain at the native 2.5 km grid is over
@@ -201,6 +235,8 @@ be pasted under *Paste a cube URL* at the bottom of the panel.
 - `src/rotpole.js` – rotated pole CRS from WKT, rotated ↔ lon/lat
 - `src/cubeworker.js` – loads cubes off the main thread
 - `src/framestore.js` – the local cache of loaded cubes (IndexedDB)
+- `src/vectormap.js` – land and sea drawn from Natural Earth vectors (the vector base map)
+- `src/vectorworker.js` – draws the vector base map off the main thread
 - `src/sun.js` – positions of the sun, the moon and the stars at a time
 - `src/stars.js` – the stars up to magnitude 5 from the Yale Bright Star Catalogue (generated)
 - `src/globe.js` – the globe projection: flat scene ↔ sphere

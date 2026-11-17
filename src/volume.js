@@ -1,7 +1,26 @@
 // Ray-marched volume rendering of a scalar field stored in a 3D texture.
 import * as THREE from 'three';
 
-const half = THREE.DataUtils.toHalfFloat;
+// Float → half float bits, with the tables of three.js's DataUtils.toHalfFloat inlined: called for every value of
+// the volume (millions per time), where its range check and call cost more than the conversion itself
+const f32 = new Float32Array(1), u32 = new Uint32Array(f32.buffer);
+const baseTable = new Uint32Array(512), shiftTable = new Uint32Array(512);
+for (let i = 0; i < 256; ++i) {
+  const e = i - 127;
+  let base, shift;
+  if (e < -27) { base = 0x0000; shift = 24; } // too small: zero
+  else if (e < -14) { base = 0x0400 >> (-e - 14); shift = -e - 1; } // subnormal
+  else if (e <= 15) { base = (e + 15) << 10; shift = 13; } // normal
+  else if (e < 128) { base = 0x7c00; shift = 24; } // too large: infinity
+  else { base = 0x7c00; shift = 13; } // infinity and NaN
+  baseTable[i] = base; baseTable[i | 0x100] = base | 0x8000;
+  shiftTable[i] = shift; shiftTable[i | 0x100] = shift;
+}
+function half(v) {
+  f32[0] = v;
+  const f = u32[0], e = (f >> 23) & 0x1ff;
+  return baseTable[e] + ((f & 0x007fffff) >> shiftTable[e]);
+}
 
 // Texel pair (value × mask, mask): linear filtering then averages only valid neighbours,
 // recovered in the shader as r / g.
@@ -137,6 +156,7 @@ export function createVolumeMaterial(shared) {
           } else {
             g = degrees(vec2(lon, lat));
           }
+          g.x = gGrid0.x + mod(g.x - gGrid0.x + 180.0, 360.0) - 180.0; // around the data's centre (e.g. 0…360° data)
           vec3 flatPoint = vec3((g - gGrid0) * gK, (r - gR) / gVscale);
           return (flatPoint - gFlat0) / gFlatSize;
         }
@@ -148,6 +168,26 @@ export function createVolumeMaterial(shared) {
         uniform float fogNear, fogFar;
       #endif
 
+      #ifdef GLOBE
+        // Where the ray (box coordinates o + d t) is inside the shell of the data around the Earth: from entering
+        // the sphere at the data's top to leaving it, or to hitting the sphere at its bottom (the ground). Large
+        // data (up to the whole Earth) is a thin shell in a big box: only this part is sampled.
+        vec2 hitShell(vec3 o, vec3 d) {
+          vec3 c = vec3(0.0, 0.0, -gR);
+          vec3 so = gBoxMin + (o + 0.5) * gBoxSize - c, sv = d * gBoxSize; // scene, relative to the centre
+          float a = dot(sv, sv), b = dot(so, sv);
+          float rOut = gR + (gFlat0.z + gFlatSize.z) * gVscale, rIn = gR + gFlat0.z * gVscale;
+          float qo = b * b - a * (dot(so, so) - rOut * rOut);
+          if (qo <= 0.0) return vec2(1.0, -1.0); // misses the shell
+          float so1 = (-b - sqrt(qo)) / a, so2 = (-b + sqrt(qo)) / a;
+          float qi = b * b - a * (dot(so, so) - rIn * rIn);
+          if (qi > 0.0) {
+            float si1 = (-b - sqrt(qi)) / a;
+            if (si1 > 0.0) so2 = min(so2, si1); // stops at the ground
+          }
+          return vec2(so1, so2);
+        }
+      #endif
       vec2 hitBox(vec3 o, vec3 d) {
         vec3 inv = 1.0 / d;
         vec3 t0 = (vec3(-0.5) - o) * inv, t1 = (vec3(0.5) - o) * inv;
@@ -192,10 +232,26 @@ export function createVolumeMaterial(shared) {
       void main() {
         vec3 d = normalize(vDirection);
         vec2 b = hitBox(vOrigin, d);
+        #ifdef GLOBE
+          vec2 sh = hitShell(vOrigin, d);
+          b = vec2(max(b.x, sh.x), min(b.y, sh.y));
+        #endif
         if (b.x > b.y) discard;
         b.x = max(b.x, 0.0);
-        float dt = 1.7320508 / steps;
+        #ifdef GLOBE
+          // Adaptive: about one texel of the data per step (see below), between Quality steps over the part in
+          // the shell (the finest) and 12 (the coarsest)
+          float dtMin = (b.y - b.x) / steps, dtMax = (b.y - b.x) / 12.0;
+          float dt = dtMin * 4.0;
+        #else
+          float dt = 1.7320508 / steps;
+        #endif
         float t = b.x + dt * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        #ifdef GLOBE
+          // Opacity per step by the step's length in the data (texture) space, as in the flat view: the same look
+          // whatever the size of the box around the curved data
+          vec3 prevTex = globeToTex(vOrigin + d * (t - dt) + 0.5);
+        #endif
         vec3 light = normalize(lightDir);
         vec3 g = 1.0 / texSize;
         vec4 acc = vec4(0.0);
@@ -205,6 +261,13 @@ export function createVolumeMaterial(shared) {
           #ifdef GLOBE
             vec3 pb = p; // the box position, for the haze depth
             p = globeToTex(pb);
+            vec3 stepTex = p - prevTex;
+            float stepLen = min(length(stepTex), 0.1); // capped: across the date line the texture x jumps
+            prevTex = p;
+            // The next step about one texel long in the data: fine where the ray crosses the data's cells or levels
+            // quickly, long where it runs along them
+            float texels = length(stepTex * texSize);
+            if (texels < 50.0) dt = clamp(dt / max(texels, 1e-3), dtMin, dtMax);
             if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(1.0)))) { t += dt; continue; }
           #endif
           float valid;
@@ -213,12 +276,14 @@ export function createVolumeMaterial(shared) {
             vec3 col;
             float a = transfer(v, col);
             if (a > 0.004) {
-              vec3 grad = vec3(
-                sampleVol(p + vec3(g.x, 0, 0)) - sampleVol(p - vec3(g.x, 0, 0)),
-                sampleVol(p + vec3(0, g.y, 0)) - sampleVol(p - vec3(0, g.y, 0)),
-                sampleVol(p + vec3(0, 0, g.z)) - sampleVol(p - vec3(0, 0, g.z)));
+              // Forward differences: three samples instead of six, for the shading only
+              vec3 grad = vec3(sampleVol(p + vec3(g.x, 0, 0)), sampleVol(p + vec3(0, g.y, 0)), sampleVol(p + vec3(0, 0, g.z))) - v;
               float shade = length(grad) > 1e-4 ? 0.45 + 0.55 * abs(dot(normalize(grad), light)) : 0.8;
-              float alpha = 1.0 - exp(-a * density * 12.0 * dt);
+              #ifdef GLOBE
+                float alpha = 1.0 - exp(-a * density * 12.0 * stepLen);
+              #else
+                float alpha = 1.0 - exp(-a * density * 12.0 * dt);
+              #endif
               col *= shade;
               #ifdef USE_FOG
                 // Depth haze per sample, at that sample's own view depth.

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as topojson from 'topojson-client';
+import { VECTOR_LAYER, drawVectorMap, landPolygons, gridProjection } from './vectormap.js';
 import { fetchJSON, parseTemporalValues, parseCubeUrl, toIso, loadCube, MAX_POINTS_PER_LEVEL } from './edr.js';
 import { frameStoreUsage, clearFrames, evictFrames } from './framestore.js';
 import { marchingCubes } from './isosurface.js';
@@ -8,7 +9,7 @@ import { COLORMAP_NAMES, makeColormapTexture, drawColorbar, hexToRgb } from './c
 import { resampleVolume, createVolumeMaterial, createVolumeTexture, updateVolumeCamera } from './volume.js';
 import { nativeCubeCrs, bboxToRot, bboxToGeo } from './rotpole.js';
 import { Streamlines } from './streamlines.js';
-import { sunPosition, moonPosition, skyEcef, enuFrame, dot } from './sun.js';
+import { sunPosition, moonPosition, skyEcef, enuFrame, dot, ecefOf } from './sun.js';
 import { STARS, STAR_NAMES } from './stars.js';
 import { makeGlobe, EARTH_RADIUS } from './globe.js';
 
@@ -94,6 +95,8 @@ const PRESETS = [
     globe: false,
     sun: false,
     starNames: false,
+    tour: false,
+    baseLayer: 'knmi_animated_gif_background_europe_elevation_1km_combined',
   },
   {
     name: 'Jet stream core on the globe – DINI (geoservices)',
@@ -117,7 +120,34 @@ const PRESETS = [
     sun: true,
     starNames: true,
     tween: -1, // continuous: on the GPU while only the volume is shown
+    baseLayer: 'knmi_animated_gif_background_europe_elevation_1km_combined',
     view: { azimuth: 150, elevation: 30, distance: 0.95 }, // from the south-east, above the Mediterranean
+  },
+  {
+    name: 'Jet streams – global (ECMWF IFS, meteocore)',
+    description: 'ECMWF IFS 0.25° from FMI meteocore: wind speed on all 14 pressure levels (1000–10 hPa) at their height, the whole Earth resampled by the server to 720×360 points, on the globe, volume filled above 33 m/s (≈ 64 kt), with the sun, moon and stars, flying around',
+    collectionUrl: 'https://meteocore.app.meteo.fi/edr/collections/ecmwf-ifs-pressure',
+    crs: '',
+    bbox: 'full',
+    stride: '1', // the server already resamples
+    levelStep: 1,
+    resolution: [720, 360], // 0.5°
+    levelsPerRequest: 1, // meteocore counts 2 values per cell: 720 × 360 × 2 = 518 k, within its limit of a million
+    parameter: 'ws',
+    levels: 'all',
+    renderMode: 'volume',
+    volStyle: '0',
+    threshold: 33,
+    density: 0.8,
+    vscale: 3.5,
+    sky: true,
+    earth: true,
+    globe: true,
+    sun: true,
+    starNames: true,
+    tween: -1,
+    tour: true,
+    baseLayer: VECTOR_LAYER, // land and sea from Natural Earth vectors: the whole world, without a WMS
   },
   {
     name: 'Jet stream – Nordic (MEPS, meteocore)',
@@ -141,6 +171,8 @@ const PRESETS = [
     globe: false,
     sun: false,
     starNames: false,
+    tour: false,
+    baseLayer: 'knmi_animated_gif_background_europe_elevation_1km_combined',
   },
 ];
 const KM_SCALE = 5; // world units per km of altitude in pressure-altitude mode
@@ -538,29 +570,66 @@ function localUp(out) {
   return out.copy(camera.position).sub(skyTmp.centre.fromArray(globe.centre)).normalize();
 }
 
-// Fly around (view bar): the camera circles the centre of the data, one turn in TOUR.period seconds, rising and
-// sinking a little. On starting it moves smoothly to a distance where all the data is in view (or stays further
-// out) at a moderate elevation; after that, dragging and zooming change the circle and it goes on from there.
+// Fly around (view bar): the camera circles the centre of the data, rising and sinking a little, one turn per
+// TOUR.period seconds. While the animation plays it is driven by it: it moves on only while the shown time moves
+// forward (not while a time is loading, or when the loop wraps), at the pace of the chosen frame time; without
+// an animation it circles in real time. On starting it moves smoothly to
+// a distance where all the data is in view (or stays further out) at a moderate elevation; after that, dragging
+// and zooming change the circle and it goes on from there.
 const TOUR = { period: 120, bob: THREE.MathUtils.degToRad(6), bobPeriod: 40, settle: 3 };
-const tour = { active: false, time: 0, settle: 0, distance: 0, elevation: 0 };
+const tour = { active: false, time: 0, settle: 0, distance: 0, elevation: 0, shown: null };
+
+// Seconds of circling since the previous frame: without an animation the real time (dt); while animating the
+// shown time that passed, at the pace of the animation (frame time per time step), 0 when it did not move forward
+function tourProgress(dt) {
+  const t = skyTime(), last = tour.shown;
+  tour.shown = t;
+  if (!anim.playing) return dt;
+  if (last == null || !(t > last)) return 0;
+  // The length of the time step being played (runs can go from hourly to 3- or 6-hourly)
+  const { ms } = timelineTimes();
+  let i = 0;
+  while (i < ms.length - 2 && ms[i + 1] <= last) i++;
+  const step = ms.length > 1 ? Math.abs(ms[i + 1] - ms[i]) || 3600000 : 3600000;
+  return Math.min(((t - last) / step) * (Number($('vcSpeed').value) / 1000), 0.25); // at most a quarter second at once
+}
 const tourTmp = { off: new THREE.Vector3(), z: new THREE.Vector3(0, 0, 1), center: new THREE.Vector3() };
 
 function startTour() {
   if (!state.geo) return;
   endFlight();
+  // Most of the Earth: spinning around it about its axis, near the equator; otherwise circling the data
+  const earth = earthCentred();
+  if (earth) setOrbitUp(northAxis());
   const sphere = dataBounds(tmpBox).getBoundingSphere(tmpSphere);
-  const halfFov = THREE.MathUtils.degToRad(camera.fov / 2), aspect = camera.aspect;
-  const fit = (sphere.radius * 1.1) / Math.sin(Math.min(halfFov, Math.atan(Math.tan(halfFov) * aspect))); // all in view
-  const off = tourTmp.off.copy(camera.position).sub(controls.target);
+  const fit = earth ? earthFitDistance() : fitDistance(sphere.radius);
+  const center = earth ? new THREE.Vector3(...globe.centre) : sphere.center;
+  const off = toAxisFrame(tourTmp.off.copy(camera.position).sub(controls.target));
   const r = off.length() || fit;
+  const el = Math.asin(THREE.MathUtils.clamp(off.z / r, -1, 1));
   Object.assign(tour, {
-    active: true, time: 0, settle: 0,
+    active: true, time: 0, settle: 0, shown: null, earth,
     distance: Math.max(r, fit),
-    elevation: THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp(off.z / r, -1, 1)), THREE.MathUtils.degToRad(15), THREE.MathUtils.degToRad(45)),
+    elevation: earth
+      ? THREE.MathUtils.clamp(el, THREE.MathUtils.degToRad(-12), THREE.MathUtils.degToRad(18))
+      : THREE.MathUtils.clamp(el, THREE.MathUtils.degToRad(15), THREE.MathUtils.degToRad(45)),
   });
-  tourTmp.center.copy(sphere.center);
+  tourTmp.center.copy(center);
   requestRender();
 }
+
+// Distance at which a sphere of radius r around the target is all in view, and the whole Earth with its data
+function fitDistance(r) {
+  const halfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+  return (r * 1.1) / Math.sin(Math.min(halfFov, Math.atan(Math.tan(halfFov) * camera.aspect)));
+}
+function earthFitDistance() {
+  return fitDistance((EARTH_RADIUS + Math.max(0, state.geo.zmax * globe.vscale)) * 1.25); // with room for the axis
+}
+// Offsets in a frame with z along the camera's up (the scene's z, or the Earth's axis) and back
+const axisQ = new THREE.Quaternion();
+const toAxisFrame = (v) => v.applyQuaternion(axisQ.setFromUnitVectors(camera.up, SCENE_Z));
+const fromAxisFrame = (v) => v.applyQuaternion(axisQ.setFromUnitVectors(SCENE_Z, camera.up));
 
 function stopTour() {
   tour.active = false;
@@ -570,8 +639,11 @@ function stopTour() {
 // Moves the camera along the circle; true while touring (so the view keeps being drawn)
 function updateTour(dt) {
   if (!tour.active || flight.active || !state.geo) return false;
-  tour.time += dt;
-  const off = tourTmp.off.copy(camera.position).sub(controls.target);
+  const progress = tourProgress(dt);
+  if (!progress && tour.settle >= 1) return false; // the animation stands still: so does the camera
+  const prevTime = tour.time;
+  tour.time += progress;
+  const off = toAxisFrame(tourTmp.off.copy(camera.position).sub(controls.target)); // z along the camera's up
   let r = off.length();
   let az = Math.atan2(off.x, off.y), el = Math.asin(THREE.MathUtils.clamp(off.z / r, -1, 1));
   // Settling in: towards the centre of the data, the distance and elevation chosen at the start
@@ -583,15 +655,14 @@ function updateTour(dt) {
     el += (tour.elevation - el) * k;
   }
   // Around, and a little up and down
-  az -= ((2 * Math.PI) / TOUR.period) * dt;
+  az -= ((2 * Math.PI) / TOUR.period) * progress;
   const w = (2 * Math.PI) / TOUR.bobPeriod;
-  el += TOUR.bob * (Math.sin(tour.time * w) - Math.sin((tour.time - dt) * w));
-  el = THREE.MathUtils.clamp(el, THREE.MathUtils.degToRad(2), THREE.MathUtils.degToRad(85));
-  camera.position.set(
-    controls.target.x + r * Math.cos(el) * Math.sin(az),
-    controls.target.y + r * Math.cos(el) * Math.cos(az),
-    controls.target.z + r * Math.sin(el),
-  );
+  el += TOUR.bob * (Math.sin(tour.time * w) - Math.sin(prevTime * w));
+  el = tour.earth
+    ? THREE.MathUtils.clamp(el, THREE.MathUtils.degToRad(-80), THREE.MathUtils.degToRad(80))
+    : THREE.MathUtils.clamp(el, THREE.MathUtils.degToRad(2), THREE.MathUtils.degToRad(85));
+  off.set(r * Math.cos(el) * Math.sin(az), r * Math.cos(el) * Math.cos(az), r * Math.sin(el));
+  camera.position.copy(controls.target).add(fromAxisFrame(off));
   return true;
 }
 
@@ -654,7 +725,8 @@ function fly(dt) {
   else if (Math.abs(flight.speed) > max) flight.speed = Math.sign(flight.speed) * (max + (Math.abs(flight.speed) - max) * Math.exp(-dt)); // after Shift: back to the top speed
   // Rates follow the keys smoothly, and fade without them
   const f = 1 - Math.exp(-FLY.response * dt);
-  flight.pitch += ((k('ArrowUp') - k('ArrowDown')) * FLY.maxPitch - flight.pitch) * f;
+  // Like a flight stick: ↑ (pushing forward) puts the nose down, ↓ (pulling back) up
+  flight.pitch += ((k('ArrowDown') - k('ArrowUp')) * FLY.maxPitch - flight.pitch) * f;
   flight.roll += ((k('ArrowLeft') - k('ArrowRight')) * FLY.maxRoll - flight.roll) * f;
   flight.yaw += ((k('KeyA') - k('KeyD')) * FLY.maxYaw - flight.yaw) * f;
   for (const key of ['pitch', 'roll', 'yaw']) if (Math.abs(flight[key]) < 1e-4) flight[key] = 0;
@@ -1303,15 +1375,16 @@ let keysCache = { base: '', times: '', keys: [] };
 function timelineKeys(times) {
   const base = buildRequest(times[0]).key, joined = times.join();
   if (keysCache.base !== base || keysCache.times !== joined) {
-    const first = JSON.stringify(times[0]);
-    keysCache = { base, times: joined, keys: times.map((t) => base.replace(first, JSON.stringify(t))) };
+    // The key is a JSON array with the time third (see buildRequest); the run's name can equal its first time
+    const parts = JSON.parse(base);
+    keysCache = { base, times: joined, keys: times.map((t) => { parts[2] = t; return JSON.stringify(parts); }) };
   }
   return keysCache.keys;
 }
 
 // ---- Time line: the playhead on the block bar, and scrubbing by clicking or dragging it
 // Position u: 0 … number of times - 1, fractional between two times (block n is centred on n).
-const scrub = { dragging: false, pending: null, busy: false, token: 0 };
+const scrub = { dragging: false, pending: null, busy: false, target: null, waiting: false };
 let timelineCounts = '', timelineLabel = '', timelineMs = { key: '', ms: [] };
 
 function timelineTimes() {
@@ -1328,6 +1401,14 @@ function updatePlayhead(force = false) {
   if (!n || !state.grid) return;
   const t = skyTime();
   let u = 0;
+  if (scrub.waiting && scrub.target != null) {
+    // The touched moment is still loading: the playhead and label are already there
+    const { i, f } = timelineMoment(scrub.target);
+    el.querySelector('.lb-head').style.left = `${((i + f + 0.5) / n) * 100}%`;
+    const at = ms[i] + (f ? f * (ms[i + 1] - ms[i]) : 0);
+    el.querySelector('.lb-label').textContent = timelineLabel = `${toIso(Math.round(at / 60000) * 60000).replace('T', ' ').slice(0, 16)}Z · loading… · ${timelineCounts}`;
+    return;
+  }
   if (t >= ms[n - 1]) u = n - 1;
   else if (t > ms[0]) {
     let i = 0;
@@ -1339,11 +1420,10 @@ function updatePlayhead(force = false) {
   if (label !== timelineLabel || force) el.querySelector('.lb-label').textContent = timelineLabel = label;
 }
 
-// Shows the moment at position u: a loaded time, or in between two (blended on the GPU when only the volume is
-// shown, interpolated on the CPU otherwise), following the In between setting (off: the nearest time)
-async function showTimelineAt(u) {
-  const { ms, iso } = timelineTimes(), n = ms.length;
-  if (n < 1) return;
+// The moment at position u, following the In between setting (off: the nearest time): { i, f } with
+// 0 ≤ f < 1 the fraction towards time i + 1
+function timelineMoment(u) {
+  const { ms } = timelineTimes(), n = ms.length;
   u = THREE.MathUtils.clamp(u, 0, n - 1);
   const mode = Number($('tweenStep').value);
   let i = Math.min(Math.floor(u), n - 1), f = u - i;
@@ -1355,17 +1435,59 @@ async function showTimelineAt(u) {
     f = (Math.round((f * span) / q) * q) / span;
     if (f >= 1) { i++; f = 0; }
   }
-  if (f < 1e-4) f = 0;
-  const token = ++scrub.token;
-  let a, b = null;
-  try {
-    a = await fetchFrame(buildRequest(iso[i]));
-    if (f > 0) b = await fetchFrame(buildRequest(iso[i + 1]));
-  } catch (e) {
-    if (e.name !== 'AbortError') setStatus(e.message, true);
+  return { i, f: f < 1e-4 ? 0 : f };
+}
+
+// Times touched on the time line that are not in memory: loaded most recently touched first, at most as many at
+// once as "ahead" in the view bar (loads already running count too), so dragging over many does not start them all
+const scrubQueue = [];
+function queueScrubLoad(time) {
+  const at = scrubQueue.indexOf(time);
+  if (at >= 0) scrubQueue.splice(at, 1);
+  scrubQueue.unshift(time);
+  pumpScrubLoads();
+}
+function pumpScrubLoads() {
+  const limit = Number($('vcPrefetch').value) || 1;
+  while (scrubQueue.length && framesLoading.size < limit) {
+    const time = scrubQueue.shift();
+    let request;
+    try { request = buildRequest(time); } catch { continue; }
+    if (cachedFrame(request.key) || framesLoading.has(request.key)) continue;
+    fetchFrame(request)
+      .then(() => { if (scrub.target != null) showTimelineAt(scrub.target); }) // shown if it is still wanted
+      .catch((e) => { if (e.name !== 'AbortError') console.warn('Could not load', time, e); })
+      .finally(pumpScrubLoads);
+  }
+}
+
+// Shows the moment at position u: a loaded time, or in between two (blended on the GPU when only the volume is
+// shown, interpolated on the CPU otherwise). Times not in memory are queued for loading; meanwhile the nearest
+// time in memory is shown, and the moment itself when it arrives (if the time line is still there).
+function showTimelineAt(u) {
+  const { ms, iso } = timelineTimes();
+  if (!ms.length) return;
+  scrub.target = u;
+  const { i, f } = timelineMoment(u);
+  const get = (k) => {
+    try { return cachedFrame(buildRequest(iso[k]).key) || null; } catch { return null; }
+  };
+  const a = get(i), b = f > 0 ? get(i + 1) : null;
+  if (!a) queueScrubLoad(iso[i]);
+  if (f > 0 && !b) queueScrubLoad(iso[i + 1]);
+  scrub.waiting = !a || (f > 0 && !b);
+  if (scrub.waiting) {
+    // Meanwhile the nearest time that is in memory, if any
+    const near = f < 0.5 ? (a ? [a, i] : b ? [b, i + 1] : null) : (b ? [b, i + 1] : a ? [a, i] : null);
+    if (near && state.grid !== near[0]) {
+      $('datetime').value = iso[near[1]];
+      showGrid(near[0]);
+    }
+    setStatus(`Loading ${iso[!a ? i : i + 1]}…`);
+    updatePlayhead(true);
     return;
   }
-  if (token !== scrub.token) return; // dragged on meanwhile
+  scrub.target = null;
   $('datetime').value = iso[i];
   if (b && sameShape(a, b)) {
     const time = toIso(Math.round((ms[i] + f * (ms[i + 1] - ms[i])) / 60000) * 60000);
@@ -1380,43 +1502,53 @@ async function showTimelineAt(u) {
   }
   updateSun({ hud: !f }); // the HUD keeps the loaded time
   setStatus(`Time ${shownTimeOf(state.grid) || iso[i]}${f ? ' (in between)' : ''}`);
+  updatePlayhead(true);
 }
 
-// One position at a time: while one is being shown, only the newest of the positions dragged over waits
-async function scrubTo(u) {
+// Several pointer moves can come in one frame: only the newest position is shown, once per frame
+function scrubTo(u) {
   scrub.pending = u;
   if (scrub.busy) return;
   scrub.busy = true;
-  try {
-    while (scrub.pending != null) {
-      const next = scrub.pending;
-      scrub.pending = null;
-      await showTimelineAt(next);
-    }
-  } finally {
+  requestAnimationFrame(() => {
     scrub.busy = false;
-  }
+    const next = scrub.pending;
+    scrub.pending = null;
+    if (next != null) showTimelineAt(next);
+  });
 }
 
 {
-  const bar = $('loadBlocks');
+  // Only the blocks scrub: the animation controls share the bar
+  const bar = $('loadBlocks'), track = bar.querySelector('.lb-track');
   const positionOf = (e) => {
     const r = bar.querySelector('.lb-row').getBoundingClientRect(), n = timelineTimes().ms.length;
     return ((e.clientX - r.left) / r.width) * n - 0.5;
   };
-  bar.addEventListener('pointerdown', (e) => {
+  track.addEventListener('pointerdown', (e) => {
     if (!bar.classList.contains('visible') || !state.grid) return;
     stopAnimation(); // scrubbing pauses; the loop is kept
     scrub.dragging = true;
-    try { bar.setPointerCapture(e.pointerId); } catch { /* e.g. a synthetic event: no capture */ }
+    try { track.setPointerCapture(e.pointerId); } catch { /* e.g. a synthetic event: no capture */ }
     scrubTo(positionOf(e));
     e.preventDefault();
   });
-  bar.addEventListener('pointermove', (e) => { if (scrub.dragging) scrubTo(positionOf(e)); });
+  track.addEventListener('pointermove', (e) => { if (scrub.dragging) scrubTo(positionOf(e)); });
   const end = () => { scrub.dragging = false; };
-  bar.addEventListener('pointerup', end);
-  bar.addEventListener('pointercancel', end);
+  track.addEventListener('pointerup', end);
+  track.addEventListener('pointercancel', end);
 }
+
+// The view controls collapse to a small button (remembered in this browser)
+function setViewControlsCollapsed(collapsed) {
+  $('viewControls').classList.toggle('collapsed', collapsed);
+  $('vcCollapse').hidden = collapsed;
+  $('vcExpand').hidden = !collapsed;
+  try { localStorage.setItem('viewControlsCollapsed', collapsed ? '1' : '0'); } catch { /* not remembered */ }
+}
+$('vcCollapse').addEventListener('click', () => setViewControlsCollapsed(true));
+$('vcExpand').addEventListener('click', () => setViewControlsCollapsed(false));
+try { if (localStorage.getItem('viewControlsCollapsed') === '1') setViewControlsCollapsed(true); } catch { /* default: shown */ }
 
 // The grid for a request: from the cache, from a load already running, or loaded now
 function fetchFrame({ opts, meta, key }, { signal, onProgress, onUrl } = {}) {
@@ -1463,6 +1595,8 @@ function showGrid(grid) {
 // empties the local cache, so the times are loaded from the server again)
 async function loadData() {
   stopAnimation();
+  scrub.target = null; // a time chosen in the panel replaces one touched on the time line
+  scrub.waiting = false;
   await state.timesReady;
   state.abort?.abort();
   const ac = new AbortController();
@@ -1480,7 +1614,7 @@ async function loadData() {
     showGrid(Object.assign(cached, request.meta));
     setStatus(`Shown from memory: ${cached.nx}×${cached.ny}×${cached.nz} points at ${opts.datetime}`);
     if (state.abort === ac) state.abort = null;
-    return;
+    return true;
   }
 
   $('load').disabled = true;
@@ -1503,6 +1637,7 @@ async function loadData() {
       : grid.serverReduced ? ' (fewer cells, chosen by the server)' : '';
     setStatus(`Loaded ${grid.nx}×${grid.ny}×${grid.nz} points${grid.proj ? ' on the native grid' : ''}${step}${grid.fromStore ? ' from the local cache' : ` with ${grid.requests} request${grid.requests > 1 ? 's' : ''}`} in ${s} s` +
       (grid.scaleFixed ? ` (×10 server fix applied to ${grid.scaleFixed} response${grid.scaleFixed > 1 ? 's' : ''})` : ''));
+    return true;
   } catch (e) {
     if (e.name === 'AbortError') setStatus('Cancelled');
     else {
@@ -1630,6 +1765,10 @@ async function startAnimation() {
     return;
   }
   state.abort?.abort(); // a load from the panel is replaced by the animation
+  // Times touched on the time line wait: the animation's own loading goes first (loads running finish)
+  scrubQueue.length = 0;
+  scrub.target = null;
+  scrub.waiting = false;
   anim.playing = true;
   anim.abort = new AbortController();
   const { signal } = anim.abort;
@@ -1680,12 +1819,19 @@ async function startAnimation() {
           await new Promise((res) => requestAnimationFrame(res));
         }
       } else if (tweening) {
-        // On the CPU: in between frames at whole multiples of the interval (5 minutes when continuous)
-        const step = tween || 5 * 60000;
+        // On the CPU: in between frames at whole multiples of the interval. Continuous with isosurfaces: the next
+        // as soon as the isosurface worker has finished the one before (as smooth as it can compute); otherwise
+        // every 5 minutes.
+        // (only with the worker: small grids are computed here, where every frame would wait for it)
+        const surfaces = () => isoGroup.visible && state.isos.some((i) => i.visible) && !!isoWorker && !isoWorkerFailed &&
+          grid.nx * grid.ny * grid.nz >= WORKER_MIN_POINTS;
+        const step = tween || (surfaces() ? 0 : 5 * 60000);
         let shown = t0;
         while (anim.playing && performance.now() - stepStart < speed) {
-          const t = t0 + Math.floor((skyTime() - t0) / step) * step;
-          if (t > shown && t < t1) {
+          const now = skyTime();
+          const t = step ? t0 + Math.floor((now - t0) / step) * step : Math.round(now / 60000) * 60000;
+          const busy = surfaces() && state.isos.some((i) => i.visible && i.busy);
+          if (t > shown && t < t1 && !busy) {
             shown = t;
             showGrid(interpolateGrid(current, grid, (t - t0) / (t1 - t0), toIso(t)));
           }
@@ -1942,7 +2088,10 @@ function dataRange() {
 // placement instead of the scale of dataGroup, so changing it rebuilds the geometry. Off: flat, as before.
 let globe = null;
 function updateGlobeMapper() {
-  globe = $('globeOn').checked && state.grid && state.geo ? makeGlobe(state.geo, state.grid.proj, vscale()) : null;
+  const want = $('globeOn').checked && state.grid && state.geo;
+  // A new time of the same grid keeps the mapper (and the bounds computed with it)
+  if (want && globe && globe.geo === state.geo && globe.vscale === vscale() && state.geo.globeBounds) return;
+  globe = want ? makeGlobe(state.geo, state.grid.proj, vscale()) : null;
   dataGroup.scale.set(1, 1, globe ? 1 : vscale());
   state.geo && (state.geo.globeBounds = globe ? globeBounds() : null);
 }
@@ -1993,9 +2142,31 @@ function dataBounds(out = new THREE.Box3()) {
   return out;
 }
 
+// The Earth's axis on the globe: a line through both poles, reaching beyond them, with N and S at its ends (the
+// Earth hides the part inside it)
+const axisGroup = new THREE.Group();
+dataGroup.add(axisGroup);
+let axisBuiltFor = null;
+function buildEarthAxis() {
+  if (axisBuiltFor === globe && (axisGroup.children.length > 0) === !!globe) return;
+  axisBuiltFor = globe;
+  disposeChildren(axisGroup);
+  if (!globe) return;
+  const out = 0.35 * EARTH_RADIUS; // beyond the surface
+  const n = globe.placeLonLat(0, 90, out), s = globe.placeLonLat(0, -90, out);
+  const geom = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([...s, ...n], 3));
+  axisGroup.add(new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0xb8c8da, transparent: true, opacity: 0.55, fog: false })));
+  for (const [text, lat] of [['N', 90], ['S', -90]]) {
+    const label = makeLabel(text, EARTH_RADIUS * 0.06);
+    label.position.fromArray(globe.placeLonLat(0, lat, out * 1.12));
+    axisGroup.add(label);
+  }
+}
+
 function rebuildAll() {
   computeGeo();
   updateGlobeMapper();
+  buildEarthAxis();
   const g = state.grid;
   const [lo, hi] = dataRange();
   g.min = lo;
@@ -2013,7 +2184,7 @@ function rebuildAll() {
   // new time of the same area keeps them (rebuilding the borders alone takes a noticeable fraction of a second)
   const { lon0, lat0, kx, ky, zmin, ext } = state.geo;
   const staticKey = JSON.stringify([lon0, lat0, kx, ky, zmin, ext, g.lons[0], g.lons.at(-1), g.lats[0], g.lats.at(-1), g.nx, g.ny,
-    g.crs, globe ? globe.vscale : 0, !!state.borders, $('baseLayer').value, $('earthOn').checked]);
+    g.crs, globe ? globe.vscale : 0, !!state.borders, $('baseLayer').value, groundLayer(), $('earthOn').checked]);
   if (staticKey !== state.staticKey) {
     state.staticKey = staticKey;
     buildBorders();
@@ -2112,7 +2283,7 @@ function buildVolume() {
   volumeUniforms.texSize.value.set(g.nx, g.ny, vol.depth);
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), volumeMaterial);
   const wantGlobe = !!globe;
-  if (!!volumeMaterial.defines.GLOBE !== wantGlobe) {
+  if (('GLOBE' in volumeMaterial.defines) !== wantGlobe) { // (the define's value is '', so not its truth)
     if (wantGlobe) volumeMaterial.defines.GLOBE = ''; else delete volumeMaterial.defines.GLOBE;
     volumeMaterial.needsUpdate = true;
   }
@@ -2255,7 +2426,7 @@ function buildGridCells() {
   const edges = (c) => [c[0], ...Array.from({ length: c.length - 1 }, (_, n) => (c[n] + c[n + 1]) / 2), c.at(-1)];
   const ex = edges(px), ey = edges(py);
   const x0 = px[0], x1 = px.at(-1), y0 = py[0], y1 = py.at(-1);
-  const zg = zmin - ext * 0.0022; // just above the base map, below the borders
+  const zg = zmin - layerSize() * 0.0022; // just above the base map, below the borders
   const pts = [];
   for (const x of ex) pushSegment(pts, x, y0, zg, x, y1, zg, ny);
   for (const y of ey) pushSegment(pts, x0, y, zg, x1, y, zg, nx);
@@ -2278,9 +2449,18 @@ function buildGridCells() {
   gridGroup.add(new THREE.LineSegments(geom, mat));
 }
 
+const boxBuilt = { geo: null, globe: null };
 function buildBox() {
+  // Only the layout and the globe mapper shape the box: a new time of the same grid keeps it
+  if (boxBuilt.geo === state.geo && boxBuilt.globe === globe && boxGroup.children.length) {
+    boxGroup.visible = $('boxOn').checked;
+    return;
+  }
+  Object.assign(boxBuilt, { geo: state.geo, globe });
   disposeChildren(boxGroup);
   const { px, py, zmin, zmax } = state.geo;
+  // Data all around the Earth on the globe: a box has no meaning there (its edges would loop at the poles)
+  if (globe && state.grid.lons.at(-1) - state.grid.lons[0] > 300) return;
   if (globe) {
     // The 12 edges, curved along the globe
     const x = [px[0], px.at(-1)], y = [py[0], py.at(-1)], z = [zmin, zmax], pts = [];
@@ -2330,7 +2510,7 @@ function buildBorders() {
   if (!state.grid) return;
   const { lons, lats, proj } = state.grid;
   const { lon0, lat0, kx, ky, zmin, px, py, ext } = state.geo;
-  const z = zmin - ext * 0.002;
+  const z = zmin - layerSize() * 0.002;
   if (state.borders) {
     const rect = [lons[0], lats[0], lons.at(-1), lats.at(-1)];
     const pts = [];
@@ -2349,6 +2529,77 @@ function buildBorders() {
 }
 
 // ---------------------------------------------------------------- WMS base map
+
+// Vector base map (Base map → Land and sea): drawn in a worker (vectorworker.js), which fetches the Natural Earth
+// file itself; on the main thread only without one, once the file of the borders is there
+const vectorWorker = (() => {
+  try {
+    if (typeof OffscreenCanvas === 'undefined') return null;
+    return new Worker(new URL('./vectorworker.js', import.meta.url), { type: 'module' });
+  } catch {
+    return null;
+  }
+})();
+const vectorJobs = new Map();
+let vectorJobId = 0;
+vectorWorker?.addEventListener('message', ({ data }) => {
+  const job = vectorJobs.get(data.id);
+  vectorJobs.delete(data.id);
+  if (data.error) job?.reject(new Error(data.error));
+  else job?.resolve(data.bitmap);
+});
+vectorWorker?.addEventListener('error', (e) => {
+  for (const job of vectorJobs.values()) job.reject(new Error(e.message || 'worker failed'));
+  vectorJobs.clear();
+});
+function drawVectorBitmap(bbox, proj, width, height) {
+  if (!vectorWorker) return Promise.reject(new Error('no worker'));
+  const id = ++vectorJobId;
+  return new Promise((resolve, reject) => {
+    vectorJobs.set(id, { resolve, reject });
+    vectorWorker.postMessage({ id, url: BORDERS_URL, bbox, pole: proj ? { lon0: proj.lon0, oLatP: proj.oLatP } : null, width, height });
+  });
+}
+let resolveVectorData;
+const vectorData = new Promise((res) => (resolveVectorData = res));
+
+// The vector map of an area in grid coordinates ([x0, y0, x1, y1]: lon/lat, or rotated lon/lat with proj), as a
+// texture cached per slot like the WMS images; size: the width in pixels (the height follows the area)
+function vectorMapTexture(slot, bbox, proj, size) {
+  const [x0, y0, x1, y1] = bbox;
+  const width = size, height = Math.max(64, Math.min(size, Math.round((size * (y1 - y0)) / Math.max(x1 - x0, 1e-9))));
+  const key = `${VECTOR_LAYER}|${bbox.map((v) => v.toFixed(4)).join(',')}|${proj?.proj4 ?? ''}|${width}x${height}`;
+  const current = state.mapTex[slot];
+  if (current?.url === key) return current.promise;
+  current?.tex?.dispose();
+  const entry = { url: key, tex: null };
+  entry.promise = drawVectorBitmap(bbox, proj, width, height)
+    .catch((e) => {
+      // Without the worker (or OffscreenCanvas): drawn here, which holds up the view for a moment
+      console.warn('Vector base map drawn on the main thread:', e.message);
+      return vectorData.then(() => {
+        state.land ??= landPolygons(topojson, state.worldTopo);
+        return drawVectorMap({ land: state.land, borders: state.borders, width, height, ...gridProjection(bbox, proj, width, height) });
+      });
+    })
+    .then((image) => {
+      const bitmap = typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap;
+      const tex = bitmap ? new THREE.Texture(image) : new THREE.CanvasTexture(image);
+      if (bitmap) tex.flipY = false; // the worker flipped it already (WebGL does not flip bitmaps)
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      tex.needsUpdate = true;
+      entry.tex = tex;
+      return tex;
+    })
+    .catch((e) => {
+      console.warn('Vector base map could not be drawn', e);
+      if (state.mapTex[slot] === entry) delete state.mapTex[slot];
+      return null;
+    });
+  state.mapTex[slot] = entry;
+  return entry.promise;
+}
 
 // One cached texture per slot, so the map under the data and the earth surface do not replace each other
 function getMapTexture(url, slot = 'ground') {
@@ -2383,7 +2634,8 @@ function buildGround() {
   const mat = new THREE.MeshBasicMaterial({
     color: 0x18212b, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
   });
-  const cx = (px[0] + px.at(-1)) / 2, cy = (py[0] + py.at(-1)) / 2, zg = zmin - ext * 0.003;
+  const cx = (px[0] + px.at(-1)) / 2, cy = (py[0] + py.at(-1)) / 2, zg = zmin - layerSize() * 0.003;
+  if (globe) addNightShading(mat); // shaded like the Earth around it
   const plane = globe ? new THREE.PlaneGeometry(w, h, 96, 96) : new THREE.PlaneGeometry(w, h);
   if (globe) {
     // Each vertex to its place on the globe (the plane's own coordinates are relative to the centre of the data)
@@ -2398,13 +2650,16 @@ function buildGround() {
   if (!globe) ground.position.set(cx, cy, zg);
   groundGroup.add(ground);
 
-  const layer = $('baseLayer').value;
+  const layer = groundLayer();
   if (!layer) return;
   const iw = 1536, ih = Math.min(2048, Math.round((iw * h) / w));
   const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${encodeURIComponent(layer)}&STYLES=` +
     `&CRS=${proj ? encodeURIComponent(`PROJ4:${proj.proj4}`) : 'CRS:84'}&BBOX=${lons[0]},${lats[0]},${lons.at(-1)},${lats.at(-1)}` +
     `&WIDTH=${iw}&HEIGHT=${ih}&FORMAT=image/png&TRANSPARENT=FALSE`;
-  getMapTexture(url).then((tex) => {
+  const texture = layer === VECTOR_LAYER
+    ? vectorMapTexture('ground', [lons[0], lats[0], lons.at(-1), lats.at(-1)], proj, 2048)
+    : getMapTexture(url);
+  texture.then((tex) => {
     if (!tex || ground.parent !== groundGroup) return;
     mat.map = tex;
     mat.color.setScalar(Number($('mapBrightness').value));
@@ -2462,7 +2717,8 @@ function buildEarth() {
   const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${encodeURIComponent(layer)}&STYLES=` +
     `&CRS=${proj ? encodeURIComponent(`PROJ4:${proj.proj4}`) : 'CRS:84'}&BBOX=${bbox.join(',')}` +
     `&WIDTH=${iw}&HEIGHT=${ih}&FORMAT=image/png&TRANSPARENT=FALSE`;
-  getMapTexture(url, 'earth').then((tex) => {
+  const texture = layer === VECTOR_LAYER ? vectorMapTexture('earth', bbox, proj, 2048) : getMapTexture(url, 'earth');
+  texture.then((tex) => {
     if (!tex || earth.parent !== earthGroup) return;
     mat.map = tex;
     mat.color.setScalar(Number($('mapBrightness').value) * EARTH_BRIGHTNESS);
@@ -2475,9 +2731,31 @@ function buildEarth() {
 // base map of the whole world (CRS:84) and faint degree lines. With the sun on, the night side is darker.
 const globeEarthUniforms = { sunDir: { value: new THREE.Vector3(0, 0, 1) }, sunOn: { value: 0 } };
 const GLOBE_LAYER = 'countryfilled'; // a base layer of the whole world
+// On the globe, the night side darker when the sun is on: the light from the direction of the sun on the radial
+// normal (for the Earth around the data and the map under it)
+function addNightShading(mat) {
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.sunDir = globeEarthUniforms.sunDir;
+    shader.uniforms.sunOn = globeEarthUniforms.sunOn;
+    shader.uniforms.globeCentre = { value: new THREE.Vector3(...globe.centre) };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 globeCentre;\nvarying vec3 vRadial;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvRadial = position - globeCentre;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 sunDir;\nuniform float sunOn;\nvarying vec3 vRadial;')
+      .replace('#include <map_fragment>', `#include <map_fragment>
+        if (sunOn > 0.5) diffuseColor.rgb *= mix(0.25, 1.0, smoothstep(-0.08, 0.12, dot(normalize(vRadial), normalize(sunDir))));`);
+  };
+  mat.customProgramCacheKey = () => 'globe-night';
+}
+
+// The size the small height offsets between the layers on the ground (earth, map, borders, grid) scale with: on
+// the globe at most that of a 6000 km area, as data covering the whole Earth would push them hundreds of km apart
+const layerSize = () => (globe ? Math.min(state.geo.ext, 6000) : state.geo.ext);
+
 function buildGlobeEarth() {
   const { zmin, ext } = state.geo;
-  const h = (zmin - ext * 0.006) * globe.vscale; // below the map under the data
+  const h = (zmin - layerSize() * 0.006) * globe.vscale; // below the map under the data
   const NLON = 256, NLAT = 128;
   const pos = new Float32Array((NLON + 1) * (NLAT + 1) * 3), uv = new Float32Array((NLON + 1) * (NLAT + 1) * 2), out = [];
   for (let j = 0; j <= NLAT; j++) {
@@ -2500,44 +2778,65 @@ function buildGlobeEarth() {
   geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   geom.setIndex(index);
   const mat = new THREE.MeshBasicMaterial({ color: 0x10161c, fog: false, polygonOffset: true, polygonOffsetFactor: 4, polygonOffsetUnits: 4 });
-  // Night side darker when the sun is on: the light from the direction of the sun on the radial normal
-  mat.onBeforeCompile = (shader) => {
-    shader.uniforms.sunDir = globeEarthUniforms.sunDir;
-    shader.uniforms.sunOn = globeEarthUniforms.sunOn;
-    shader.uniforms.globeCentre = { value: new THREE.Vector3(...globe.centre) };
-    shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nuniform vec3 globeCentre;\nvarying vec3 vRadial;')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvRadial = position - globeCentre;');
-    shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nuniform vec3 sunDir;\nuniform float sunOn;\nvarying vec3 vRadial;')
-      .replace('#include <map_fragment>', `#include <map_fragment>
-        if (sunOn > 0.5) diffuseColor.rgb *= mix(0.25, 1.0, smoothstep(-0.08, 0.12, dot(normalize(vRadial), normalize(sunDir))));`);
-  };
-  mat.customProgramCacheKey = () => 'globe-earth';
+  addNightShading(mat);
   const earth = new THREE.Mesh(geom, mat);
   earth.frustumCulled = false;
   earthGroup.add(earth);
 
-  // Degree lines every 15°
+  // Degree lines every 15°, just above the map under the data (which can cover the whole Earth)
+  const hl = (state.geo.zmin - layerSize() * 0.0025) * globe.vscale;
   const pts = [];
-  for (let lon = -180; lon < 180; lon += 15) for (let lat = -90; lat < 90; lat += 2) pts.push(...globe.placeLonLat(lon, lat, h), ...globe.placeLonLat(lon, lat + 2, h));
-  for (let lat = -75; lat <= 75; lat += 15) for (let lon = -180; lon < 180; lon += 2) pts.push(...globe.placeLonLat(lon, lat, h), ...globe.placeLonLat(lon + 2, lat, h));
+  for (let lon = -180; lon < 180; lon += 15) for (let lat = -90; lat < 90; lat += 2) pts.push(...globe.placeLonLat(lon, lat, hl), ...globe.placeLonLat(lon, lat + 2, hl));
+  for (let lat = -75; lat <= 75; lat += 15) for (let lon = -180; lon < 180; lon += 2) pts.push(...globe.placeLonLat(lon, lat, hl), ...globe.placeLonLat(lon + 2, lat, hl));
   const lineGeom = new THREE.BufferGeometry();
   lineGeom.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-  earthGroup.add(new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: 0x8fa3b8, transparent: true, opacity: 0.12, depthWrite: false, fog: false })));
+  earthGroup.add(new THREE.LineSegments(lineGeom, new THREE.LineBasicMaterial({ color: 0x8fa3b8, transparent: true, opacity: 0.22, depthWrite: false, fog: false })));
 
   // The selected base layer may cover only Europe (empty elsewhere): the globe uses a world layer, and the map
   // under the data keeps the selected one
   if (!$('baseLayer').value) return;
+  const vector = $('baseLayer').value === VECTOR_LAYER; // the same vector map around the data, a little darker
   const url = `${WMS_URL}SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${GLOBE_LAYER}&STYLES=` +
     '&CRS=CRS:84&BBOX=-180,-90,180,90&WIDTH=4096&HEIGHT=2048&FORMAT=image/png&TRANSPARENT=FALSE';
-  getMapTexture(url, 'globe').then((tex) => {
+  (vector ? vectorMapTexture('globe', [-180, -90, 180, 90], null, 4096) : getMapTexture(url, 'globe')).then((tex) => {
     if (!tex || earth.parent !== earthGroup) return;
     mat.map = tex;
-    mat.color.setScalar(Number($('mapBrightness').value) * 0.35); // darker than the data area, which stays on top
+    mat.color.setScalar(Number($('mapBrightness').value) * (vector ? 0.7 : 0.35)); // darker than the data area, which stays on top
     mat.needsUpdate = true;
     requestRender();
   });
+}
+
+// Extent (lon/lat) of each base layer, from the capabilities: a layer that does not cover the data (e.g. a Europe
+// map for global data) is replaced by the world layer under the data
+const baseLayerExtent = new Map();
+const BASE_LAYER_DEFAULT_EXTENT = [-38.17, 29.93, 72.01, 72.69]; // the default Europe layer, until the capabilities are read
+
+// The lon/lat range of the data (on a rotated grid: of its edges)
+function dataLonLatBounds() {
+  const { lons, lats, proj } = state.grid;
+  if (!proj) return [lons[0], lats[0], lons.at(-1), lats.at(-1)];
+  const b = [Infinity, Infinity, -Infinity, -Infinity];
+  for (let k = 0; k <= 16; k++) {
+    const x = lons[0] + ((lons.at(-1) - lons[0]) * k) / 16, y = lats[0] + ((lats.at(-1) - lats[0]) * k) / 16;
+    for (const [gx, gy] of [[x, lats[0]], [x, lats.at(-1)], [lons[0], y], [lons.at(-1), y]]) {
+      const [lon, lat] = proj.toGeo(gx, gy);
+      b[0] = Math.min(b[0], lon); b[1] = Math.min(b[1], lat); b[2] = Math.max(b[2], lon); b[3] = Math.max(b[3], lat);
+    }
+  }
+  return b;
+}
+
+// The base layer for the map under the data: the selected one, or the world layer when that does not cover it
+function groundLayer() {
+  const layer = $('baseLayer').value;
+  if (!layer || layer === GLOBE_LAYER) return layer;
+  const ext = baseLayerExtent.get(layer) ?? (layer === 'knmi_animated_gif_background_europe_elevation_1km_combined' ? BASE_LAYER_DEFAULT_EXTENT : null);
+  if (!ext) return layer;
+  // Kept when it covers most of the data (a little beyond its edge just shows the background colour)
+  const [w, s, e, n] = dataLonLatBounds();
+  const overlap = Math.max(0, Math.min(e, ext[2]) - Math.max(w, ext[0])) * Math.max(0, Math.min(n, ext[3]) - Math.max(s, ext[1]));
+  return overlap >= 0.6 * Math.max((e - w) * (n - s), 1e-6) ? layer : GLOBE_LAYER;
 }
 
 async function loadBaseLayers() {
@@ -2548,8 +2847,13 @@ async function loadBaseLayers() {
     const doc = new DOMParser().parseFromString(await r.text(), 'text/xml');
     const child = (el, tag) => [...el.children].find((c) => c.localName === tag)?.textContent;
     layers = [...doc.getElementsByTagNameNS('*', 'Layer')]
-      .map((l) => ({ name: child(l, 'Name'), title: child(l, 'Title') }))
+      .map((l) => {
+        const g = [...l.children].find((c) => c.localName === 'EX_GeographicBoundingBox');
+        const ext = g && ['westBoundLongitude', 'southBoundLatitude', 'eastBoundLongitude', 'northBoundLatitude'].map((k) => Number(child(g, k)));
+        return { name: child(l, 'Name'), title: child(l, 'Title'), ext: ext?.every(Number.isFinite) ? ext : null };
+      })
       .filter((l) => l.name);
+    for (const l of layers) if (l.ext) baseLayerExtent.set(l.name, l.ext);
   } catch (e) {
     console.warn('Could not read baselayers capabilities', e);
     return;
@@ -2557,14 +2861,18 @@ async function loadBaseLayers() {
   const current = sel.value;
   sel.innerHTML = '';
   sel.append(option('', 'None'));
+  sel.append(option(VECTOR_LAYER, 'Land and sea (vector, Natural Earth)'));
   for (const l of layers) sel.append(option(l.name, l.title && l.title !== l.name ? l.title : l.name));
-  sel.value = layers.some((l) => l.name === current) ? current : '';
+  sel.value = current === VECTOR_LAYER || layers.some((l) => l.name === current) ? current : '';
+  if (state.grid) buildGround(); // now the layer's extent is known (see groundLayer)
 }
 
 async function loadBorders() {
   try {
     const topo = await fetchJSON(BORDERS_URL, { retries: 1 });
     state.borders = topojson.mesh(topo, topo.objects.countries).coordinates;
+    state.worldTopo = topo; // for the vector base map, when it has to be drawn on the main thread
+    resolveVectorData();
     if (state.grid) buildBorders();
   } catch (e) {
     console.warn('Could not load borders', e);
@@ -2747,7 +3055,10 @@ isoWorker?.addEventListener('message', ({ data }) => {
     computeIsoHere(iso);
     return;
   }
-  if (data.key === isoFieldKey(g)) showIsoResult(iso, data, data.ms);
+  // Also a surface of the previous time of the same grid (an in-between frame while animating): shown, as the
+  // newest one would otherwise never arrive while the frames keep coming; then the newest is computed
+  const layout = (key) => key.slice(key.indexOf(':'));
+  if (data.key === isoFieldKey(g) || layout(data.key) === layout(isoFieldKey(g))) showIsoResult(iso, data, data.ms);
   // A newer value (or another grid) was asked for meanwhile: compute that one now
   if (iso.wanted !== data.value || data.key !== isoFieldKey(g)) requestIso(iso);
 });
@@ -2877,8 +3188,11 @@ function updateIsoLines() {
 
 function updateColormap() {
   const name = $('colormap').value;
-  sliceUniforms.cmap.value.dispose();
-  sliceUniforms.cmap.value = makeColormapTexture(name);
+  if (sliceUniforms.cmap.value.userData.name !== name) { // a new texture only for another colour map
+    sliceUniforms.cmap.value.dispose();
+    sliceUniforms.cmap.value = makeColormapTexture(name);
+    sliceUniforms.cmap.value.userData.name = name;
+  }
   sliceUniforms.vmin.value = Number($('rangeMin').value);
   sliceUniforms.vmax.value = Number($('rangeMax').value);
   sliceUniforms.interval.value = Number($('contourInterval').value);
@@ -2927,7 +3241,16 @@ function buildLabels() {
   labelGroup.visible = $('labelsOn').checked;
   const { lons, lats, levels, vmode } = state.grid;
   const { px, py, lon0, lat0, kx, ky, ext, zmin, zmax, levelSpacing } = state.geo;
-  const s = vscale(), h = ext * 0.028, z0 = zmin * s, pad = ext * 0.04;
+  // On the globe at most the size for a 6000 km area: global data would otherwise get labels of 1000 km
+  const size = globe ? Math.min(ext, 6000) : ext;
+  const s = vscale(), h = size * 0.028, z0 = zmin * s, pad = size * 0.04;
+  // On the globe, data reaching far towards a pole gets its longitude labels along the latitude nearest the
+  // equator (not at the pole, where they would all meet), and data all around the Earth its latitude labels
+  // along the meridian nearest 0° and its levels at the equator
+  const nearPole = globe && (lats[0] < -60 || lats.at(-1) > 60), allAround = globe && lons.at(-1) - lons[0] > 300;
+  const clampTo = (v, a, b) => Math.min(Math.max(v, a), b);
+  const lonLabelY = nearPole ? (clampTo(0, lats[0], lats.at(-1)) - lat0) * ky : py[0] - pad;
+  const latLabelX = allAround ? (clampTo(0, lons[0], lons.at(-1)) - lon0) * kx : px[0] - pad * 1.6;
   const add = (text, x, y, z) => {
     const l = makeLabel(text, h);
     if (globe) l.position.fromArray(globe.place(x, y, z / s)); // z comes scaled; the globe scales it itself
@@ -2935,13 +3258,16 @@ function buildLabels() {
     labelGroup.add(l);
   };
   const lonStep = niceStep(lons.at(-1) - lons[0], 6);
-  for (let l = Math.ceil(lons[0] / lonStep) * lonStep; l <= lons.at(-1); l += lonStep) add(axisText(`${+l.toFixed(2)}`, 'x'), (l - lon0) * kx, py[0] - pad, z0);
+  for (let l = Math.ceil(lons[0] / lonStep) * lonStep; l <= lons.at(-1); l += lonStep) add(axisText(`${+l.toFixed(2)}`, 'x'), (l - lon0) * kx, lonLabelY, z0);
   const latStep = niceStep(lats.at(-1) - lats[0], 6);
-  for (let l = Math.ceil(lats[0] / latStep) * latStep; l <= lats.at(-1); l += latStep) add(axisText(`${+l.toFixed(2)}`, 'y'), px[0] - pad * 1.6, (l - lat0) * ky, z0);
+  for (let l = Math.ceil(lats[0] / latStep) * latStep; l <= lats.at(-1); l += latStep) add(axisText(`${+l.toFixed(2)}`, 'y'), latLabelX, (l - lat0) * ky, z0);
 
-  const x = px[0] - pad, y = py.at(-1) + pad; // vertical axis on the north-west corner
+  // Vertical axis on the north-west corner; for data reaching a pole, on the west edge at the latitude nearest the equator
+  const x = allAround ? latLabelX : px[0] - pad, y = nearPole ? lonLabelY : py.at(-1) + pad;
   const vkind = state.grid.vkind;
-  if (vkind === 'pressure' || vkind === 'height') {
+  if (allAround) {
+    // All around the Earth: level labels at one spot would only pile up in front of the data
+  } else if (vkind === 'pressure' || vkind === 'height') {
     // A label per level at its height, skipping levels too close to the previous label
     const text = VERTICAL_KINDS[vkind].text;
     let lastZ = -Infinity;
@@ -2978,8 +3304,35 @@ function applyVScale() {
   } else if (!globe) {
     dataGroup.scale.z = s;
   }
-  buildLabels();
+  // The labels depend on the grid layout (kept in state.geo), the vertical scale and the globe, not on the time
+  // (on the globe the mapper, which carries the vertical scale; it is replaced when that changes)
+  if (labelsBuilt.geo !== state.geo || labelsBuilt.s !== s || labelsBuilt.globe !== globe || !labelGroup.children.length) {
+    buildLabels();
+    Object.assign(labelsBuilt, { geo: state.geo, s, globe });
+  }
   syncViewControls();
+}
+const labelsBuilt = { geo: null, s: 0, globe: null };
+
+// Data covering a large part of the Earth on the globe: the view is centred on the Earth itself, with north up
+// (orbiting, and flying around, about the Earth's axis), instead of on the data with its local vertical up
+function earthCentred() {
+  if (!globe || !state.grid || !state.geo) return false;
+  const [w, s, e, n] = dataLonLatBounds();
+  return e - w >= 150 || n - s >= 100;
+}
+const SCENE_Z = new THREE.Vector3(0, 0, 1), ORBIT_Y = new THREE.Vector3(0, 1, 0);
+// The Earth's axis (towards the north pole) in the scene
+function northAxis(out = new THREE.Vector3()) {
+  const { frame } = state.geo;
+  return out.set(frame.x[2], frame.y[2], frame.up[2]).normalize();
+}
+// The camera's up direction, which is also the axis the orbit controls turn about
+function setOrbitUp(up) {
+  if (camera.up.equals(up)) return;
+  camera.up.copy(up);
+  controls._quat.setFromUnitVectors(camera.up, ORBIT_Y); // OrbitControls computes these once, from camera.up
+  controls._quatInverse.copy(controls._quat).invert();
 }
 
 // view (optional, e.g. from a preset): { azimuth (where the camera is, degrees clockwise from grid north),
@@ -2991,6 +3344,23 @@ function fitCamera(view = null) {
     controls.enabled = true;
   }
   if (!state.geo) return;
+  if (globe && earthCentred()) {
+    // Most of the Earth: looking at its centre from above the data's longitude, near the equator, north up
+    const north = northAxis();
+    setOrbitUp(north);
+    const centre = new THREE.Vector3(...globe.centre), { frame } = state.geo;
+    const v = ecefOf(frame.lon, 12); // a little north of the equator
+    const dir = new THREE.Vector3(dot(frame.x, v), dot(frame.y, v), dot(frame.up, v)).normalize();
+    const d = earthFitDistance();
+    controls.target.copy(centre);
+    camera.position.copy(centre).addScaledVector(dir, d);
+    camera.near = d / 500;
+    camera.far = Math.max(d * 20, EARTH_RADIUS * 12);
+    camera.updateProjectionMatrix();
+    controls.update();
+    return;
+  }
+  setOrbitUp(SCENE_Z);
   if (globe) {
     // Around the curved data, with the far plane beyond the whole Earth
     const sphere = dataBounds(tmpBox).getBoundingSphere(tmpSphere);
@@ -3226,9 +3596,11 @@ async function applyPreset(p) {
   if (p.gridCells != null) $('gridOn').checked = p.gridCells; // drawn when the data is shown
   if (p.earth != null) $('earthOn').checked = p.earth;
   if (p.globe != null) $('globeOn').checked = p.globe;
+  if (p.baseLayer != null && [...$('baseLayer').options].some((o) => o.value === p.baseLayer)) $('baseLayer').value = p.baseLayer;
   if (p.sun != null) $('sunOn').checked = p.sun;
   if (p.starNames != null) $('starNamesOn').checked = p.starNames;
   if (p.tween != null) $('tweenStep').value = String(p.tween);
+  if (p.tour != null && !p.tour && tour.active) stopTour();
   if (p.sky != null) {
     $('skyOn').checked = p.sky;
     skyGroup.visible = celestialGroup.visible = p.sky;
@@ -3256,8 +3628,12 @@ async function applyPreset(p) {
   updateVolumeSettings();
   updateIsoLines();
   applyVScale();
-  await loadData();
-  if (state.grid) fitCamera(p.view); // a preset starts with its own view (or the default one)
+  if (!(await loadData())) return; // not loaded: the view stays as it was
+  fitCamera(p.view); // a preset starts with its own view (or the default one)
+  if (p.tour) {
+    $('vcTour').checked = true;
+    startTour();
+  }
 }
 
 for (const p of PRESETS) {
@@ -3522,6 +3898,38 @@ $('clearCache').addEventListener('click', async () => {
   setStatus('Cache cleared: times are loaded from the server again');
 });
 updateLocalCacheInfo(0);
+
+// Background loading (Data → Load the other times in the background): while not animating, the other times of the
+// run are loaded one at a time, forward from the shown time and then from the start, skipping those in memory or
+// in the local cache. It waits while animating (that loads ahead itself), while times touched on the time line or
+// a load from the panel are loading, and while the tab is hidden. Each time is loaded at most once per session,
+// so a full memory (oldest times dropped) does not make it load them over and over. A load is never cancelled:
+// the animation or the panel may be waiting for the same time.
+const bgLoaded = new Set(); // request keys loaded in the background
+let bgBusy = false;
+function backgroundLoadTick() {
+  if (bgBusy || !$('bgLoad').checked || anim.playing || document.hidden || !state.grid) return;
+  if (framesLoading.size || scrubQueue.length || state.abort) return; // something else is loading
+  const { iso } = timelineTimes();
+  if (iso.length < 2) return;
+  let keys;
+  try { keys = timelineKeys(iso); } catch { return; }
+  const start = Math.max(0, iso.indexOf(state.grid.datetime));
+  for (let k = 1; k < iso.length; k++) {
+    const n = (start + k) % iso.length, key = keys[n];
+    if (bgLoaded.has(key) || frameCache.has(key) || storedKeys.has(key)) continue;
+    bgLoaded.add(key);
+    bgBusy = true;
+    fetchFrame(buildRequest(iso[n]))
+      .catch((e) => { if (e.name !== 'AbortError') console.warn('Background load of', iso[n], 'failed:', e.message); })
+      .finally(() => { bgBusy = false; });
+    return;
+  }
+}
+setInterval(backgroundLoadTick, 1000);
+// Off after every page load (not remembered): it can load a lot of data
+$('bgLoad').checked = false;
+try { localStorage.removeItem('bgLoad'); } catch { /* nothing stored */ }
 
 $('vcTour').addEventListener('change', () => ($('vcTour').checked ? startTour() : stopTour()));
 

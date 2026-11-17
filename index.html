@@ -118,6 +118,7 @@
         <span id="localCacheInfo" class="muted grow"></span>
         <button id="clearCache" title="Remove all cached times (local and in memory), so they are loaded from the server again">Clear</button>
       </div>
+      <label class="check bg-load" title="When not animating, load the other times of the run one at a time (forward from the shown time), so they are there when you step, scrub or animate. Waits while animating, scrubbing or loading, and while the tab is hidden; each time at most once per session."><input id="bgLoad" type="checkbox"> Load the other times in the background</label>
       <div class="row">
         <button id="load" class="primary grow">Load</button>
         <button id="cancel" disabled>Cancel</button>
@@ -209,6 +210,7 @@
       <label class="stack">Base map (KNMI baselayers WMS)
         <select id="baseLayer">
           <option value="knmi_animated_gif_background_europe_elevation_1km_combined" selected>Europe elevation 1km combined</option>
+          <option value="vector:naturalearth">Land and sea (vector, Natural Earth)</option>
         </select>
       </label>
       <label class="slider">Map brightness <input id="mapBrightness" type="range" min="0.2" max="1" step="0.05" value="0.75"><output></output></label>
@@ -244,15 +246,61 @@
     <canvas id="c"></canvas>
     <div id="viewControls" class="view-controls" aria-label="View controls">
       <button id="showPanel" class="icon show-panel" title="Show the controls" hidden>☰</button>
-      <label class="vc-param">Parameter
-        <select id="vcParam" title="Parameter shown; changing it loads the new parameter"></select>
-      </label>
-      <label class="vc-time">Time
-        <span class="vc-inline">
-          <button id="vcTimePrev" class="icon" title="Previous time">‹</button>
-          <select id="vcTime" title="Time shown; changing it loads that time"></select>
-          <button id="vcTimeNext" class="icon" title="Next time">›</button>
-          <button id="vcPlay" class="icon play deck first" title="Animate over time">&#x25B6;&#xFE0E;</button>
+      <div class="vc-items">
+        <label class="vc-param"><span>Parameter</span>
+          <select id="vcParam" title="Parameter shown; changing it loads the new parameter"></select>
+        </label>
+        <label class="vc-time"><span>Time</span>
+          <span class="vc-inline">
+            <button id="vcTimePrev" class="icon" title="Previous time">‹</button>
+            <select id="vcTime" title="Time shown; changing it loads that time"></select>
+            <button id="vcTimeNext" class="icon" title="Next time">›</button>
+          </span>
+        </label>
+        <label id="vcThresholdWrap" class="vc-threshold" title="First isosurface value, also the volume's fill threshold"><span>Threshold</span>
+          <span class="vc-inline">
+            <input id="vcThreshold" type="range" step="0.1">
+            <input id="vcThresholdNum" type="number" step="0.1">
+            <span id="vcUnit" class="vc-unit"></span>
+          </span>
+        </label>
+        <label id="vcDensityWrap" class="vc-density" title="Opacity of the volume"><span>Density</span>
+          <span class="vc-inline">
+            <input id="vcDensity" type="range" min="-1.3" max="1.3" step="0.01">
+            <output id="vcDensityOut"></output>
+          </span>
+        </label>
+        <label class="vc-render"><span>Show as</span>
+          <select id="vcRender" title="How the threshold is drawn">
+            <option value="vol-0">Volume – fill above</option>
+            <option value="vol-1">Volume – fill below</option>
+            <option value="vol-2">Volume – band around</option>
+            <option value="iso">Isosurface</option>
+          </select>
+        </label>
+        <label class="vc-vscale"><span>Vertical</span>
+          <span class="vc-inline">
+            <input id="vcVscale" type="range" min="-1" max="1.5" step="any" title="Vertical scale">
+            <output id="vcVscaleOut"></output>
+          </span>
+        </label>
+        <label id="vcStreamWrap" class="vc-check" title="Particles moving with the wind, inside the volume" hidden>
+          <input id="vcStream" type="checkbox" checked> Streamlines
+        </label>
+        <label class="vc-check" title="Circle slowly around the data, from a distance where all of it is in view, rising and sinking a little. While the animation plays it moves with it, and waits while a time is loading; otherwise it circles on its own. Dragging and zooming still work; flying with the keys stops it.">
+          <input id="vcTour" type="checkbox"> Fly around
+        </label>
+      </div>
+      <button id="vcCollapse" class="icon vc-collapse" title="Hide the view controls" aria-expanded="true">▴</button>
+      <button id="vcExpand" class="vc-expand" title="Show the view controls" hidden>▾ View</button>
+    </div>
+    <div id="hud"></div>
+    <div id="flightInfo" class="flight-info" aria-live="off"></div>
+    <div id="fps" class="fps" aria-live="off" title="Frames drawn per second, the longest time between two frames, and the main-thread time per frame (the page and three.js preparing the drawing; the graphics card works on after that). The view is only drawn when something changes: idle when nothing moves."></div>
+    <div id="loadBlocks" class="load-blocks" aria-live="off">
+      <div class="lb-top">
+        <span class="lb-deck">
+          <button id="vcPlay" class="icon play deck" title="Animate over time">&#x25B6;&#xFE0E;</button>
           <button id="vcStop" class="icon deck" title="Stop: end the animation and go back to the first time">&#x23F9;&#xFE0E;</button>
           <select id="vcSpeed" class="speed" title="Time per frame (at least; loading a new time can take longer)">
             <option value="250">0.25 s</option>
@@ -274,48 +322,11 @@
           </select>
           <span id="vcAnimInfo" class="vc-unit"></span>
         </span>
-      </label>
-      <div class="vc-column">
-        <label id="vcThresholdWrap" class="vc-threshold" title="First isosurface value, also the volume's fill threshold">Threshold
-          <span class="vc-inline">
-            <input id="vcThreshold" type="range" step="0.1">
-            <input id="vcThresholdNum" type="number" step="0.1">
-            <span id="vcUnit" class="vc-unit"></span>
-          </span>
-        </label>
-        <label id="vcDensityWrap" class="vc-density" title="Opacity of the volume">Density
-          <span class="vc-inline">
-            <input id="vcDensity" type="range" min="-1.3" max="1.3" step="0.01">
-            <output id="vcDensityOut"></output>
-          </span>
-        </label>
+        <span class="lb-label"></span>
       </div>
-      <label class="vc-render">Show as
-        <select id="vcRender" title="How the threshold is drawn">
-          <option value="vol-0">Volume – fill above</option>
-          <option value="vol-1">Volume – fill below</option>
-          <option value="vol-2">Volume – band around</option>
-          <option value="iso">Isosurface</option>
-        </select>
-      </label>
-      <label id="vcStreamWrap" class="vc-check" title="Particles moving with the wind, inside the volume" hidden>
-        <span class="vc-inline"><input id="vcStream" type="checkbox" checked> Streamlines</span>
-      </label>
-      <label class="vc-check" title="Circle slowly around the data, from a distance where all of it is in view, rising and sinking a little. Dragging and zooming still work; flying with the keys stops it.">
-        <span class="vc-inline"><input id="vcTour" type="checkbox"> Fly around</span>
-      </label>
-      <label class="vc-vscale">Vertical scale
-        <span class="vc-inline">
-          <input id="vcVscale" type="range" min="-1" max="1.5" step="any">
-          <output id="vcVscaleOut"></output>
-        </span>
-      </label>
+      <div class="lb-track" title="Time line: a block per time of the run, filled when loaded. Click or drag to show any moment, also between two times (pauses the animation)."><div class="lb-row"></div><div class="lb-head"></div></div>
     </div>
-    <div id="hud"></div>
-    <div id="flightInfo" class="flight-info" aria-live="off"></div>
-    <div id="fps" class="fps" aria-live="off" title="Frames drawn per second, the longest time between two frames, and the main-thread time per frame (the page and three.js preparing the drawing; the graphics card works on after that). The view is only drawn when something changes: idle when nothing moves."></div>
-    <div id="loadBlocks" class="load-blocks" aria-live="off" title="Time line: a block per time of the run, filled when loaded. Click or drag to show any moment, also between two times (pauses the animation)."><div class="lb-label"></div><div class="lb-track"><div class="lb-row"></div><div class="lb-head"></div></div></div>
-    <div class="keys-hint">Fly: <kbd>W</kbd><kbd>S</kbd> faster/slower, backwards · <kbd>↑</kbd><kbd>↓</kbd> pitch ·
+    <div class="keys-hint">Fly: <kbd>W</kbd><kbd>S</kbd> faster/slower, backwards · <kbd>↑</kbd><kbd>↓</kbd> nose down/up ·
       <kbd>←</kbd><kbd>→</kbd> roll · <kbd>A</kbd><kbd>D</kbd> rudder · <kbd>R</kbd> level · <kbd>Shift</kbd> boost ·
       <kbd>Space</kbd> stop · mouse: orbit</div>
     <div id="tooltip" hidden></div>

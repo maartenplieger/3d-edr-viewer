@@ -13,3 +13,7 @@ topojson-client (ISC License, Copyright 2012-2019 Michael Bostock).
 The star positions, magnitudes and colours in src/stars.js come from the Yale Bright Star Catalogue, 5th revised
 edition (Hoffleit & Warren 1991, public domain), via https://github.com/brettonw/YaleBrightStarCatalog
 (MIT License, Copyright Bretton Wade).
+
+The vector borders and the vector base map (land, coastlines, country borders) are drawn from world-atlas
+(https://github.com/topojson/world-atlas, ISC License, Copyright 2013-2019 Michael Bostock), made from
+Natural Earth data (https://www.naturalearthdata.com, public domain), loaded at run time.
